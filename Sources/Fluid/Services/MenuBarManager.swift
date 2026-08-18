@@ -5,6 +5,7 @@ import SwiftUI
 
 enum MenuBarNavigationDestination: String {
     case customDictionary
+    case microphoneSettings
     case preferences
 }
 
@@ -17,6 +18,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
 
     // Cached menu items to avoid rebuilding entire menu
     private var statusMenuItem: NSMenuItem?
+    private var copyLastTranscriptMenuItem: NSMenuItem?
     private var rollbackMenuItem: NSMenuItem?
     private var microphoneMenuItem: NSMenuItem?
     private var microphoneSubmenu: NSMenu?
@@ -24,6 +26,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     // References to app state
     private weak var asrService: ASRService?
     private var cancellables = Set<AnyCancellable>()
+    private var configuredASRIdentifier: ObjectIdentifier?
 
     /// Overlay management (persistent, independent of window lifecycle)
     private var overlayVisible: Bool = false
@@ -36,8 +39,9 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     @Published var isRecording: Bool = false
 
     /// One-shot navigation requests from the menu bar into the main window UI.
-    /// `ContentView` consumes this and clears it.
+    /// The manager clears each generation after the front-most view has handled it.
     @Published var requestedNavigationDestination: MenuBarNavigationDestination? = nil
+    private var navigationRequestGeneration: UInt64 = 0
 
     /// Track current overlay mode for notch
     private var currentOverlayMode: OverlayMode = .dictation
@@ -48,9 +52,8 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     private var pendingProcessingShowOperation: DispatchWorkItem?
     /// Show immediately so users see the processing state right away.
     private let processingVisualDelay: DispatchTimeInterval = .milliseconds(0)
-    /// Debounce the hide so a fast transcription doesn't flash the processing
-    /// overlay for a single frame. 80ms is under the perception threshold but
-    /// long enough to coalesce a quick show->hide cycle.
+    /// Legacy debounce used by generic processing callers. Successful dictation
+    /// completion dispatches output first, then hides the overlay asynchronously.
     private let processingHideDelay: DispatchTimeInterval = .milliseconds(80)
 
     /// Subscription for forwarding audio levels to expanded command notch
@@ -58,7 +61,12 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
 
     override init() {
         super.init()
-        // Don't setup menu bar immediately - defer until app is ready
+        NotificationCenter.default.publisher(for: .openMicrophoneSettingsRequested)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.openMicrophoneSettingsFromUI()
+            }
+            .store(in: &self.cancellables)
     }
 
     func initializeMenuBar() {
@@ -75,7 +83,23 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     }
 
     func configure(asrService: ASRService) {
+        let identifier = ObjectIdentifier(asrService)
+        guard self.configuredASRIdentifier != identifier else { return }
+        self.configuredASRIdentifier = identifier
         self.asrService = asrService
+        if SettingsStore.shared.overlayPosition == .bottom {
+            DispatchQueue.main.async {
+                guard SettingsStore.shared.overlayPosition == .bottom else { return }
+                BottomOverlayWindowController.shared.prepare()
+            }
+        }
+        NotificationCenter.default.publisher(for: NSNotification.Name("OverlayPositionChanged"))
+            .receive(on: DispatchQueue.main)
+            .sink { _ in
+                guard SettingsStore.shared.overlayPosition == .bottom else { return }
+                BottomOverlayWindowController.shared.prepare()
+            }
+            .store(in: &self.cancellables)
 
         // Subscribe to recording state changes
         asrService.$isRunning
@@ -104,6 +128,18 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
 
     private func handleOverlayState(isRunning: Bool, asrService: ASRService) {
         self.overlayBench("handle_state isRunning=\(isRunning) overlayVisible=\(self.overlayVisible) processing=\(self.isProcessingActive) mode=\(self.currentOverlayMode.rawValue)")
+
+        // Dictionary training owns its recording controls, so showing the
+        // regular dictation notch here would create two competing overlays.
+        if asrService.isDictionaryTrainingCaptureActive {
+            self.pendingShowOperation?.cancel()
+            self.pendingShowOperation = nil
+            if self.overlayVisible {
+                self.overlayVisible = false
+                NotchOverlayManager.shared.hide()
+            }
+            return
+        }
 
         // Don't hide the overlay while AI processing is active.
         // Without this, the notch can disappear during the short "Refining..." phase because
@@ -216,6 +252,8 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     }
 
     func showRecordingOverlayImmediately() {
+        AutomaticDictionaryCorrectionTracker.shared.cancel()
+
         guard let asrService else {
             self.overlayBench("instant_show_return reason=no_asr_service")
             return
@@ -303,6 +341,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
 
         // Track processing state to prevent hide during AI refinement
         self.isProcessingActive = processing
+        self.updateMenuItemsText()
 
         if processing {
             self.pendingProcessingShowOperation?.cancel()
@@ -356,6 +395,44 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         }
     }
 
+    /// Ends processing and waits for the recording overlay's exit transition.
+    /// Output paths normally call this asynchronously after insertion dispatch
+    /// so the exit animation cannot delay text delivery.
+    func finishProcessingAndHideOverlay() async {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        self.cancelPendingProcessingCompletionOperations()
+        self.isProcessingActive = false
+        self.overlayVisible = false
+
+        NotchOverlayManager.shared.setProcessing(false)
+        self.overlayBench("finish_hide_request")
+        let hideOutcome = await NotchOverlayManager.shared.hideAndWait()
+        self.overlayBench(
+            "finish_hide_complete outcome=\(hideOutcome) elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded()))"
+        )
+    }
+
+    /// Ends processing without dismissing an actionable overlay, such as the
+    /// AI fallback state that offers reprocessing and settings actions.
+    func finishProcessingKeepingOverlayVisible() {
+        self.cancelPendingProcessingCompletionOperations()
+        self.isProcessingActive = false
+        // Keep the physical overlay visible, but release recording/processing
+        // ownership so the next recording can establish a fresh lifecycle.
+        self.overlayVisible = false
+        NotchOverlayManager.shared.setProcessing(false)
+        self.overlayBench("finish_keep_visible")
+    }
+
+    private func cancelPendingProcessingCompletionOperations() {
+        self.pendingProcessingShowOperation?.cancel()
+        self.pendingProcessingShowOperation = nil
+        self.pendingHideOperation?.cancel()
+        self.pendingHideOperation = nil
+        self.pendingShowOperation?.cancel()
+        self.pendingShowOperation = nil
+    }
+
     private func overlayBench(_ message: String) {
         DebugLogger.shared.benchmark("OVERLAY_BENCH", message: "manager \(message)", source: "OverlayBenchmark")
     }
@@ -389,6 +466,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
 
         // Create menu
         self.menu = NSMenu()
+        self.menu?.autoenablesItems = false
         self.menu?.delegate = self
         statusItem.menu = self.menu
 
@@ -416,6 +494,15 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         if let statusItem = statusMenuItem {
             menu.addItem(statusItem)
         }
+
+        let copyLastTranscriptItem = NSMenuItem(
+            title: "Copy Last Transcript",
+            action: #selector(copyLastTranscript(_:)),
+            keyEquivalent: ""
+        )
+        copyLastTranscriptItem.target = self
+        menu.addItem(copyLastTranscriptItem)
+        self.copyLastTranscriptMenuItem = copyLastTranscriptItem
 
         menu.addItem(.separator())
 
@@ -497,6 +584,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         let hotkeyInfo = hotkeyDisplay.isEmpty ? "" : " (\(hotkeyDisplay))"
         let statusTitle = self.isRecording ? "Recording...\(hotkeyInfo)" : "Ready to Record\(hotkeyInfo)"
         self.statusMenuItem?.title = statusTitle
+        self.copyLastTranscriptMenuItem?.isEnabled = self.canCopyLastTranscript
         self.microphoneMenuItem?.isEnabled = true
 
         // Update rollback availability text
@@ -505,6 +593,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         if menu === self.menu {
+            AnalyticsService.shared.recordAppActivity()
             self.updateMenuItemsText()
             self.refreshMicrophoneMenu()
         }
@@ -518,8 +607,8 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         loadingItem.isEnabled = false
         submenu.addItem(loadingItem)
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let inputDevices = AudioDevice.listInputDevices()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let inputDevices = AudioDevice.listInputDevicesRefreshingLiveness()
             let defaultInputUID = AudioDevice.getDefaultInputDevice()?.uid
 
             DispatchQueue.main.async { [weak self] in
@@ -544,14 +633,40 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
             return
         }
 
-        let currentUID = self.currentPreferredInputUID(defaultInputUID: defaultInputUID)
+        let microphonePreferenceCoordinator = AppServices.shared.microphonePreferenceCoordinator
+        let currentUID = microphonePreferenceCoordinator.reconcileMicrophoneSelection(
+            availableInputs: inputDevices,
+            defaultInputUID: defaultInputUID
+        )?.uid
 
-        for device in inputDevices {
-            let isSystemDefault = device.uid == defaultInputUID
-            let title = isSystemDefault ? "\(device.name) (System Default)" : device.name
+        guard SettingsStore.shared.microphonePriority.isEmpty == false else {
+            let emptyItem = NSMenuItem(title: "No microphones in priority", action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            submenu.addItem(emptyItem)
+            return
+        }
+
+        let devicesByUID = Dictionary(
+            inputDevices.map { ($0.uid, $0) },
+            uniquingKeysWith: { current, _ in current }
+        )
+        for (index, entry) in SettingsStore.shared.microphonePriority.enumerated() {
+            guard let device = devicesByUID[entry.uid],
+                  microphonePreferenceCoordinator.isInputDeviceAvailable(device)
+            else {
+                let item = NSMenuItem(
+                    title: "\(index + 1). \(entry.name) (Unavailable)",
+                    action: nil,
+                    keyEquivalent: ""
+                )
+                item.isEnabled = false
+                submenu.addItem(item)
+                continue
+            }
+            let title = "\(index + 1). \(device.name)"
             let item = NSMenuItem(title: title, action: #selector(selectMicrophone(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = device.uid
+            item.representedObject = device
             item.state = device.uid == currentUID ? .on : .off
             item.isEnabled = !self.isRecording
             submenu.addItem(item)
@@ -565,19 +680,27 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         }
     }
 
-    private func currentPreferredInputUID(defaultInputUID: String?) -> String? {
-        return defaultInputUID
+    private var canCopyLastTranscript: Bool {
+        !self.isProcessingActive && TranscriptionHistoryStore.shared.latestClipboardText != nil
+    }
+
+    @objc private func copyLastTranscript(_ sender: Any?) {
+        guard self.canCopyLastTranscript,
+              let text = TranscriptionHistoryStore.shared.latestClipboardText
+        else {
+            DebugLogger.shared.info("Menu action: Copy last transcript requested but history is empty", source: "MenuBarManager")
+            return
+        }
+
+        _ = ClipboardService.copyToClipboard(text)
+        DebugLogger.shared.info("Menu action: Copied latest transcription to clipboard", source: "MenuBarManager")
     }
 
     @objc private func selectMicrophone(_ sender: NSMenuItem) {
         guard self.isRecording == false else { return }
-        guard let uid = sender.representedObject as? String, !uid.isEmpty else { return }
+        guard let device = sender.representedObject as? AudioDevice.Device else { return }
 
-        SettingsStore.shared.preferredInputDeviceUID = uid
-
-        if SettingsStore.shared.syncAudioDevicesWithSystem {
-            _ = AudioDevice.setDefaultInputDevice(uid: uid)
-        }
+        SettingsStore.shared.recordInputDeviceSelection(device.uid, name: device.name)
 
         self.refreshMicrophoneMenu()
     }
@@ -599,12 +722,8 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
                     repo: "Fluid-oss",
                     includePrerelease: SettingsStore.shared.betaReleasesEnabled
                 )
-                let ok = NSAlert()
-                ok.messageText = "Update Found!"
-                ok.informativeText = "A new version is available and will be installed now."
-                ok.alertStyle = .informational
-                ok.addButton(withTitle: "OK")
-                ok.runModal()
+            } catch SimpleUpdateError.updateAlreadyInProgress {
+                DebugLogger.shared.info("Update installation already in progress", source: "MenuBarManager")
             } catch {
                 let msg = NSAlert()
                 if let pmkError = error as? PMKError, pmkError.isCancelled {
@@ -788,6 +907,8 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     }
 
     private func openNavigationDestination(_ destination: MenuBarNavigationDestination) {
+        self.navigationRequestGeneration &+= 1
+        let requestGeneration = self.navigationRequestGeneration
         // Ensure a fresh one-shot request every time the menu item is clicked.
         self.requestedNavigationDestination = nil
         self.requestedNavigationDestination = destination
@@ -797,14 +918,26 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         // Nudge again after the window is front-most, so an already-open ContentView
         // will still switch tabs even if it consumed a previous navigation request.
         DispatchQueue.main.async { [weak self] in
-            self?.requestedNavigationDestination = nil
-            self?.requestedNavigationDestination = destination
+            guard let self, self.navigationRequestGeneration == requestGeneration else { return }
+            self.requestedNavigationDestination = nil
+            self.requestedNavigationDestination = destination
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self,
+                      self.navigationRequestGeneration == requestGeneration,
+                      self.requestedNavigationDestination == destination
+                else { return }
+                self.requestedNavigationDestination = nil
+            }
         }
     }
 
     /// Public entry-point for non-menu UI surfaces (e.g. overlay controls) to open Preferences.
     func openPreferencesFromUI() {
         self.openPreferences()
+    }
+
+    func openMicrophoneSettingsFromUI() {
+        self.openNavigationDestination(.microphoneSettings)
     }
 
     /// Create and present a fresh main window hosting `ContentView`

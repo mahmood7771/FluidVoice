@@ -11,10 +11,20 @@ import FluidAudio
 
 // swiftlint:disable file_length type_body_length
 final class SettingsStore: ObservableObject {
+    static let microphonePriorityMigrationVersion = 4
+
     static let shared = SettingsStore()
     static let transcriptionPreviewCharLimitRange: ClosedRange<Int> = 50...800
     static let transcriptionPreviewCharLimitStep = 50
     static let defaultTranscriptionPreviewCharLimit = 150
+    static let privateAIContextTokenLimitRange: ClosedRange<Int> = 2048...8192
+    static let privateAIContextTokenLimitStep = 512
+    static let defaultPrivateAIContextTokenLimit = 4096
+    static let privateAIDictationSystemOverheadTokens = 1280
+    static let privateAIDictationMinimumOutputTokens = 256
+    static let privateAIDictationRoundTripTokenCost = 2.75
+    static let privateAIBackendPreferenceDefaultsKey = "FluidIntelligenceBackendPreference"
+    private static let forcedOnboardingResetIntroducedAt = Date(timeIntervalSince1970: 1_782_091_732)
     private let defaults = UserDefaults.standard
     private let keychain = KeychainService.shared
     private(set) var launchAtStartupEnabled = false
@@ -32,10 +42,70 @@ final class SettingsStore: ObservableObject {
         self.migrateSecondaryPromptShortcutIfNeeded()
         self.retireLegacySecondaryPromptShortcutIfNeeded()
         self.normalizePromptSelectionsIfNeeded()
-        self.normalizeProviderSelectionForCurrentVerificationState()
-        self.enforceOnboardingGenerationIfNeeded()
+        self.purgeRetiredAppleIntelligenceState()
+        self.repairForcedOnboardingResetIfNeeded()
         self.migrateOverlayBottomOffsetTo50IfNeeded()
+        self.migratePrivateAIContextDefaultTo4KIfNeeded()
         self.refreshLaunchAtStartupStatus(clearError: true, logMismatch: false)
+    }
+
+    static func clampPrivateAIContextTokenLimit(_ value: Int) -> Int {
+        min(max(value, self.privateAIContextTokenLimitRange.lowerBound), self.privateAIContextTokenLimitRange.upperBound)
+    }
+
+    static func estimatedPrivateAIDictationWords(for contextTokenLimit: Int) -> Int {
+        let availableTokens = max(0, Self.clampPrivateAIContextTokenLimit(contextTokenLimit) - Self.privateAIDictationSystemOverheadTokens)
+        let inputTokens = Double(availableTokens) / Self.privateAIDictationRoundTripTokenCost
+        return max(100, Int((inputTokens * 0.75 / 50).rounded(.up)) * 50)
+    }
+
+    static func privateAIMaxOutputTokens(forInputText inputText: String, contextTokenLimit: Int) -> Int {
+        let wordCount = inputText.split { $0.isWhitespace || $0.isNewline }.count
+        let estimatedInputTokens = max(1, Int((Double(wordCount) / 0.75).rounded(.up)))
+        let requestedOutputTokens = max(
+            Self.privateAIDictationMinimumOutputTokens,
+            Int((Double(estimatedInputTokens) * 1.15).rounded(.up)) + 64
+        )
+        let availableOutputTokens = max(
+            Self.privateAIDictationMinimumOutputTokens,
+            Self.clampPrivateAIContextTokenLimit(contextTokenLimit) - Self.privateAIDictationSystemOverheadTokens - estimatedInputTokens
+        )
+        return min(requestedOutputTokens, availableOutputTokens)
+    }
+
+    enum PrivateAIBackendPreference: String, Codable, CaseIterable, Identifiable {
+        case auto
+        case llama
+        case mlx
+
+        var id: String { self.rawValue }
+
+        /// Default backend when no preference is stored.
+        /// Apple Silicon → MLX (fastest Fluid-1 path). Intel → llama.cpp.
+        static var systemDefault: PrivateAIBackendPreference {
+            CPUArchitecture.isAppleSilicon ? .mlx : .llama
+        }
+
+        var displayName: String {
+            switch self {
+            case .auto: return Self.systemDefault.displayName
+            case .llama: return "llama.cpp (Compatibility)"
+            case .mlx: return "MLX (Recommended)"
+            }
+        }
+
+        var detail: String {
+            switch self {
+            case .auto:
+                return Self.systemDefault.detail
+            case .llama:
+                return CPUArchitecture.isAppleSilicon
+                    ? "Optional and slower than MLX. Replaces MLX after verification."
+                    : "Recommended compatibility backend for Intel Macs."
+            case .mlx:
+                return "Recommended and faster than llama.cpp. Replaces it after verification."
+            }
+        }
     }
 
     // MARK: - Prompt Profiles (Unified)
@@ -109,6 +179,31 @@ final class SettingsStore: ObservableObject {
                 return "Secondary Dictation Shortcut"
             }
         }
+    }
+
+    enum MicrophoneSelectionMode: String, Codable, CaseIterable, Identifiable {
+        case system
+        case manual
+
+        var id: String {
+            self.rawValue
+        }
+
+        var displayName: String {
+            switch self {
+            case .system:
+                return "Use macOS Default"
+            case .manual:
+                return "Use Preferred Microphone"
+            }
+        }
+    }
+
+    struct MicrophonePriorityEntry: Codable, Hashable, Identifiable {
+        let uid: String
+        var name: String
+
+        var id: String { self.uid }
     }
 
     enum DictationPromptSelection: Equatable {
@@ -336,6 +431,14 @@ final class SettingsStore: ObservableObject {
         set {
             objectWillChange.send()
             self.defaults.set(newValue, forKey: Keys.dictationPromptOff)
+        }
+    }
+
+    var sendCustomPromptOnly: Bool {
+        get { self.defaults.bool(forKey: Keys.sendCustomPromptOnly) }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.sendCustomPromptOnly)
         }
     }
 
@@ -1034,7 +1137,7 @@ final class SettingsStore: ObservableObject {
                         profile: profile,
                         appBinding: binding,
                         promptBody: body,
-                        systemPrompt: Self.combineBasePrompt(for: normalizedMode, with: body)
+                        systemPrompt: self.systemPrompt(forCustomProfileBody: body, mode: normalizedMode)
                     )
                 }
             }
@@ -1063,7 +1166,7 @@ final class SettingsStore: ObservableObject {
                     profile: profile,
                     appBinding: nil,
                     promptBody: body,
-                    systemPrompt: Self.combineBasePrompt(for: normalizedMode, with: body)
+                    systemPrompt: self.systemPrompt(forCustomProfileBody: body, mode: normalizedMode)
                 )
             }
         }
@@ -1113,7 +1216,7 @@ final class SettingsStore: ObservableObject {
             }
             let body = Self.stripBasePrompt(for: .dictate, from: profile.prompt)
             if !body.isEmpty {
-                return Self.combineBasePrompt(for: .dictate, with: body)
+                return self.systemPrompt(forCustomProfileBody: body, mode: .dictate)
             }
             return self.effectiveSystemPrompt(for: .dictate, appBundleID: appBundleID)
         }
@@ -1186,6 +1289,15 @@ final class SettingsStore: ObservableObject {
             promptBody: defaultBody,
             systemPrompt: Self.combineBasePrompt(for: mode, with: defaultBody)
         )
+    }
+
+    private func systemPrompt(forCustomProfileBody body: String, mode: PromptMode) -> String {
+        let normalizedMode = mode.normalized
+        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalizedMode == .dictate, self.sendCustomPromptOnly {
+            return trimmedBody
+        }
+        return Self.combineBasePrompt(for: normalizedMode, with: trimmedBody)
     }
 
     // MARK: - Model Reasoning Configuration
@@ -1268,6 +1380,24 @@ final class SettingsStore: ObservableObject {
         set {
             objectWillChange.send()
             self.defaults.set(newValue, forKey: Keys.showMainWindowAtLoginLaunch)
+        }
+    }
+
+    /// Label speakers ("Speaker 1", "Speaker 2") in file transcriptions (default: OFF).
+    var fileTranscriptionSpeakerLabelsEnabled: Bool {
+        get { self.defaults.bool(forKey: Keys.fileTranscriptionSpeakerLabelsEnabled) }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.fileTranscriptionSpeakerLabelsEnabled)
+        }
+    }
+
+    /// Expected speaker count hint for file transcription diarization. 0 = auto-detect.
+    var fileTranscriptionExpectedSpeakerCount: Int {
+        get { self.defaults.integer(forKey: Keys.fileTranscriptionExpectedSpeakerCount) }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.fileTranscriptionExpectedSpeakerCount)
         }
     }
 
@@ -1388,14 +1518,55 @@ final class SettingsStore: ObservableObject {
         }
     }
 
-    /// No-op: never override the user's provider selection on launch.
-    ///
-    /// The per-prompt shortcut system means the global default provider is no longer the
-    /// authoritative routing source — each shortcut can bind to its own provider/model, or be off.
-    /// The only time we set a provider is during onboarding (Fluid Intelligence flow); after that
-    /// the selection is sticky across restarts and updates. Default is off (empty).
-    func normalizeProviderSelectionForCurrentVerificationState() {
-        // Intentionally empty. Selection is sticky.
+    func purgeRetiredAppleIntelligenceState() {
+        let retiredProviderIDs = Set(["apple-intelligence", "apple-intelligence-disabled"])
+        let rawSelectedProviderID = self.defaults.string(forKey: Keys.selectedProviderID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let rawSelectedProviderID, retiredProviderIDs.contains(rawSelectedProviderID) {
+            self.selectedProviderID = ""
+            self.selectedModel = nil
+        }
+
+        if retiredProviderIDs.contains(self.commandModeSelectedProviderID) {
+            self.commandModeSelectedProviderID = ""
+            self.commandModeSelectedModel = nil
+        }
+        if retiredProviderIDs.contains(self.rewriteModeSelectedProviderID) {
+            self.rewriteModeSelectedProviderID = ""
+            self.rewriteModeSelectedModel = nil
+        }
+
+        var fingerprints = self.verifiedProviderFingerprints
+        var availableModels = self.availableModelsByProvider
+        var selectedModels = self.selectedModelByProvider
+        for providerID in retiredProviderIDs {
+            fingerprints.removeValue(forKey: providerID)
+            availableModels.removeValue(forKey: providerID)
+            selectedModels.removeValue(forKey: providerID)
+            fingerprints.removeValue(forKey: "custom:\(providerID)")
+            availableModels.removeValue(forKey: "custom:\(providerID)")
+            selectedModels.removeValue(forKey: "custom:\(providerID)")
+        }
+        if fingerprints != self.verifiedProviderFingerprints {
+            self.verifiedProviderFingerprints = fingerprints
+        }
+        if availableModels != self.availableModelsByProvider {
+            self.availableModelsByProvider = availableModels
+        }
+        if selectedModels != self.selectedModelByProvider {
+            self.selectedModelByProvider = selectedModels
+        }
+
+        let configurations = self.dictationPromptConfigurations.compactMapValues { configuration in
+            let providerID = configuration.providerID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard retiredProviderIDs.contains(providerID) else { return configuration }
+            guard configuration.shortcut != nil else { return nil }
+            return DictationPromptConfiguration(shortcut: configuration.shortcut)
+        }
+        if configurations != self.dictationPromptConfigurations {
+            self.dictationPromptConfigurations = configurations
+        }
     }
 
     var privateAIPrefixKVCacheEnabled: Bool {
@@ -1404,6 +1575,59 @@ final class SettingsStore: ObservableObject {
             objectWillChange.send()
             self.defaults.set(newValue, forKey: PrivateAIProviderFeature.shared.prefixCacheDefaultsKey)
         }
+    }
+
+    var privateAIBoostEnabled: Bool {
+        get { self.defaults.object(forKey: PrivateAIProviderFeature.shared.boostDefaultsKey) as? Bool ?? true }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: PrivateAIProviderFeature.shared.boostDefaultsKey)
+        }
+    }
+
+    var privateAIBackendPreference: PrivateAIBackendPreference {
+        get {
+            let rawValue = self.defaults.string(forKey: Keys.privateAIBackendPreference)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            var preference = rawValue.flatMap(PrivateAIBackendPreference.init(rawValue:))
+                ?? PrivateAIBackendPreference.systemDefault
+            if preference == .auto {
+                preference = PrivateAIBackendPreference.systemDefault
+            }
+            if preference == .mlx, CPUArchitecture.isIntel {
+                return .llama
+            }
+            return preference
+        }
+        set {
+            objectWillChange.send()
+            var preference = newValue == .auto ? PrivateAIBackendPreference.systemDefault : newValue
+            if preference == .mlx, CPUArchitecture.isIntel {
+                preference = .llama
+            }
+            self.defaults.set(preference.rawValue, forKey: Keys.privateAIBackendPreference)
+        }
+    }
+
+    var privateAIContextTokenLimit: Int {
+        get {
+            let value = self.defaults.integer(forKey: Keys.privateAIContextTokenLimit)
+            return Self.clampPrivateAIContextTokenLimit(value == 0 ? Self.defaultPrivateAIContextTokenLimit : value)
+        }
+        set {
+            objectWillChange.send()
+            self.defaults.set(Self.clampPrivateAIContextTokenLimit(newValue), forKey: Keys.privateAIContextTokenLimit)
+        }
+    }
+
+    private func migratePrivateAIContextDefaultTo4KIfNeeded() {
+        guard self.defaults.bool(forKey: Keys.privateAIContextDefaultMigratedTo4K) == false else { return }
+        let storedValue = self.defaults.object(forKey: Keys.privateAIContextTokenLimit) as? Int
+        if storedValue == nil || storedValue == Self.privateAIContextTokenLimitRange.lowerBound {
+            self.defaults.set(Self.defaultPrivateAIContextTokenLimit, forKey: Keys.privateAIContextTokenLimit)
+        }
+        self.defaults.set(true, forKey: Keys.privateAIContextDefaultMigratedTo4K)
     }
 
     var savedProviders: [SavedProvider] {
@@ -1434,10 +1658,7 @@ final class SettingsStore: ObservableObject {
     var isAIConfigured: Bool {
         let providerID = self.selectedProviderID
 
-        // 1. Apple Intelligence is always considered configured
-        if providerID == "apple-intelligence" { return true }
-
-        // 2. Get base URL to check for local endpoints
+        // Get base URL to check for local endpoints
         var baseURL = ""
         if let saved = self.savedProviders.first(where: { $0.id == providerID }) {
             baseURL = saved.baseURL
@@ -1447,7 +1668,7 @@ final class SettingsStore: ObservableObject {
 
         let isLocal = ModelRepository.shared.isLocalEndpoint(baseURL)
 
-        // 3. Check for API key and selected model
+        // Check for API key and selected model
         let key = self.canonicalProviderKey(for: providerID)
         let hasApiKey = !(self.providerAPIKeys[key]?.isEmpty ?? true)
 
@@ -1565,6 +1786,16 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Skips clearly silent recordings up to four seconds before invoking ASR.
+    /// Opt-in so quiet speech keeps the existing transcription behavior by default.
+    var skipSilentRecordingsEnabled: Bool {
+        get { self.defaults.object(forKey: Keys.skipSilentRecordingsEnabled) as? Bool ?? false }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.skipSilentRecordingsEnabled)
+        }
+    }
+
     var enableAIStreaming: Bool {
         get {
             let value = self.defaults.object(forKey: Keys.enableAIStreaming)
@@ -1576,15 +1807,10 @@ final class SettingsStore: ObservableObject {
         }
     }
 
-    var parakeetFinalizationMode: ParakeetFinalizationMode {
-        get {
-            self.defaults.string(forKey: Keys.parakeetFinalizationMode).flatMap(ParakeetFinalizationMode.init(rawValue:)) ?? .stableFullFinal
-        }
-        set {
-            objectWillChange.send()
-            self.defaults.set(newValue.rawValue, forKey: Keys.parakeetFinalizationMode)
-        }
-    }
+    /// Direct Core Audio is the required capture backend. Legacy persisted
+    /// preferences are intentionally ignored because AVAudioEngine can block or
+    /// crash while audio devices are changing.
+    var experimentalDirectAudioCaptureEnabled: Bool { true }
 
     var copyTranscriptionToClipboard: Bool {
         get { self.defaults.bool(forKey: Keys.copyTranscriptionToClipboard) }
@@ -1596,23 +1822,188 @@ final class SettingsStore: ObservableObject {
         set { self.defaults.set(newValue, forKey: Keys.preferredInputDeviceUID) }
     }
 
+    var microphonePriority: [MicrophonePriorityEntry] {
+        get {
+            guard let data = self.defaults.data(forKey: Keys.microphonePriority),
+                  let entries = try? JSONDecoder().decode([MicrophonePriorityEntry].self, from: data)
+            else { return [] }
+            return Self.normalizedMicrophonePriority(entries)
+        }
+        set {
+            let entries = Self.normalizedMicrophonePriority(newValue)
+            guard entries != self.microphonePriority else { return }
+            objectWillChange.send()
+            if let data = try? JSONEncoder().encode(entries) {
+                self.defaults.set(data, forKey: Keys.microphonePriority)
+            } else {
+                self.defaults.removeObject(forKey: Keys.microphonePriority)
+            }
+            if let firstUID = entries.first?.uid {
+                self.preferredInputDeviceUID = firstUID
+            }
+        }
+    }
+
+    var suppressedMicrophoneUIDs: Set<String> {
+        get { Set(self.defaults.stringArray(forKey: Keys.suppressedMicrophoneUIDs) ?? []) }
+        set {
+            if newValue.isEmpty {
+                self.defaults.removeObject(forKey: Keys.suppressedMicrophoneUIDs)
+            } else {
+                self.defaults.set(newValue.sorted(), forKey: Keys.suppressedMicrophoneUIDs)
+            }
+        }
+    }
+
     var preferredOutputDeviceUID: String? {
         get { self.defaults.string(forKey: Keys.preferredOutputDeviceUID) }
         set { self.defaults.set(newValue, forKey: Keys.preferredOutputDeviceUID) }
     }
 
-    /// When enabled, changing audio devices in FluidVoice will also update macOS system audio settings.
-    /// ALWAYS TRUE: Independent mode removed due to CoreAudio aggregate device limitations (OSStatus -10851)
-    var syncAudioDevicesWithSystem: Bool {
+    var storedMicSelectionModeForMigration: MicrophoneSelectionMode {
+        guard let rawValue = self.defaults.string(forKey: Keys.microphoneSelectionMode),
+              let mode = MicrophoneSelectionMode(rawValue: rawValue)
+        else { return .system }
+        return mode
+    }
+
+    var hasStoredMicSelectionModeForMigration: Bool {
+        self.defaults.object(forKey: Keys.microphoneSelectionMode) != nil
+    }
+
+    var microphoneSelectionMode: MicrophoneSelectionMode {
         get {
-            // Always return true - independent mode doesn't work for Bluetooth/aggregate devices
-            return true
+            guard let rawValue = self.defaults.string(forKey: Keys.microphoneSelectionMode),
+                  let mode = MicrophoneSelectionMode(rawValue: rawValue)
+            else { return .manual }
+            return mode
         }
         set {
-            // No-op: sync mode is always enabled
-            // Kept for backward compatibility but value is ignored
-            _ = newValue
+            objectWillChange.send()
+            self.defaults.set(newValue.rawValue, forKey: Keys.microphoneSelectionMode)
         }
+    }
+
+    func recordInputDeviceSelection(_ uid: String, name: String? = nil) {
+        guard uid.isEmpty == false else { return }
+
+        var suppressedUIDs = self.suppressedMicrophoneUIDs
+        suppressedUIDs.remove(uid)
+        self.suppressedMicrophoneUIDs = suppressedUIDs
+
+        var entries = self.microphonePriority.filter { $0.uid != uid }
+        let existingName = self.microphonePriority.first { $0.uid == uid }?.name
+        entries.insert(
+            MicrophonePriorityEntry(uid: uid, name: name ?? existingName ?? "Microphone"),
+            at: 0
+        )
+        self.microphonePriority = entries
+        self.microphoneSelectionMode = .manual
+    }
+
+    func reconcileMicrophonePriority(with devices: [AudioDevice.Device]) {
+        var entries = self.microphonePriority
+        let preferredUID = self.preferredInputDeviceUID
+        let connectedUIDs = Set(devices.map(\.uid))
+        var suppressedUIDs = self.suppressedMicrophoneUIDs
+        suppressedUIDs.formIntersection(connectedUIDs)
+        self.suppressedMicrophoneUIDs = suppressedUIDs
+
+        if entries.isEmpty,
+           let preferredUID,
+           preferredUID.isEmpty == false
+        {
+            let name = devices.first { $0.uid == preferredUID }?.name ?? "Previously selected microphone"
+            entries.append(MicrophonePriorityEntry(uid: preferredUID, name: name))
+        }
+
+        var knownUIDs = Set(entries.map(\.uid))
+        let newEntries = devices.compactMap { device -> MicrophonePriorityEntry? in
+            guard suppressedUIDs.contains(device.uid) == false,
+                  knownUIDs.insert(device.uid).inserted
+            else { return nil }
+            return MicrophonePriorityEntry(uid: device.uid, name: device.name)
+        }
+        if newEntries.isEmpty == false {
+            // Keep the user's first choice stable while making a newly connected
+            // microphone the immediate fallback. Its position remains persisted
+            // when the device later disconnects.
+            entries.insert(contentsOf: newEntries, at: min(1, entries.count))
+        }
+
+        let namesByUID = Dictionary(
+            devices.map { ($0.uid, $0.name) },
+            uniquingKeysWith: { current, _ in current }
+        )
+        entries = entries.map { entry in
+            MicrophonePriorityEntry(uid: entry.uid, name: namesByUID[entry.uid] ?? entry.name)
+        }
+        self.microphonePriority = entries
+    }
+
+    func removeMicrophoneFromPriority(uid: String, isConnected: Bool) {
+        guard uid.isEmpty == false else { return }
+
+        var suppressedUIDs = self.suppressedMicrophoneUIDs
+        if isConnected {
+            suppressedUIDs.insert(uid)
+        } else {
+            suppressedUIDs.remove(uid)
+        }
+        self.suppressedMicrophoneUIDs = suppressedUIDs
+
+        let entries = self.microphonePriority.filter { $0.uid != uid }
+        self.microphonePriority = entries
+        if entries.isEmpty {
+            self.preferredInputDeviceUID = nil
+        }
+    }
+
+    func restoreRemovedMicrophones(with devices: [AudioDevice.Device]) {
+        self.suppressedMicrophoneUIDs = []
+        self.reconcileMicrophonePriority(with: devices)
+    }
+
+    func reorderMicrophonePriority(fromOffsets: IndexSet, toOffset: Int) {
+        var entries = self.microphonePriority
+        entries.move(fromOffsets: fromOffsets, toOffset: toOffset)
+        self.microphonePriority = entries
+    }
+
+    func moveMicrophonePriority(uid: String, before targetUID: String) {
+        guard uid != targetUID else { return }
+        var entries = self.microphonePriority
+        guard let sourceIndex = entries.firstIndex(where: { $0.uid == uid }),
+              let targetIndex = entries.firstIndex(where: { $0.uid == targetUID })
+        else { return }
+
+        let entry = entries.remove(at: sourceIndex)
+        let adjustedTargetIndex = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex
+        entries.insert(entry, at: adjustedTargetIndex)
+        self.microphonePriority = entries
+    }
+
+    func moveMicrophonePriority(uid: String, by offset: Int) {
+        var entries = self.microphonePriority
+        guard let sourceIndex = entries.firstIndex(where: { $0.uid == uid }) else { return }
+        let destination = min(max(sourceIndex + offset, 0), entries.count - 1)
+        guard destination != sourceIndex else { return }
+        entries.swapAt(sourceIndex, destination)
+        self.microphonePriority = entries
+    }
+
+    private static func normalizedMicrophonePriority(
+        _ entries: [MicrophonePriorityEntry]
+    ) -> [MicrophonePriorityEntry] {
+        var seen = Set<String>()
+        return entries.filter { entry in
+            entry.uid.isEmpty == false && seen.insert(entry.uid).inserted
+        }
+    }
+
+    var microphoneSelectionMigrationVersion: Int {
+        get { self.defaults.integer(forKey: Keys.microphoneSelectionMigrationVersion) }
+        set { self.defaults.set(newValue, forKey: Keys.microphoneSelectionMigrationVersion) }
     }
 
     var visualizerNoiseThreshold: Double {
@@ -1688,6 +2079,7 @@ final class SettingsStore: ObservableObject {
         set {
             objectWillChange.send()
             self.defaults.set(newValue.rawValue, forKey: Keys.overlayPosition)
+            NotificationCenter.default.post(name: NSNotification.Name("OverlayPositionChanged"), object: nil)
         }
     }
 
@@ -2099,27 +2491,6 @@ final class SettingsStore: ObservableObject {
         set { self.defaults.set(newValue, forKey: Keys.playgroundUsed) }
     }
 
-    /// Bump this when shipping a version that should force all users (new + existing) through
-    /// onboarding again. The user's stored generation is compared on init; if it's below this
-    /// value, onboarding is reset. Each forced ship increments this by 1.
-    private static let currentOnboardingGeneration: Int = 2
-
-    /// Force onboarding reset for users whose stored generation is below the current one.
-    /// Called during init() so it takes effect before any UI decision.
-    private func enforceOnboardingGenerationIfNeeded() {
-        let storedGeneration = self.defaults.integer(forKey: Keys.onboardingGeneration)
-        guard storedGeneration < Self.currentOnboardingGeneration else { return }
-
-        // Reset onboarding state and bump the stored generation so this is a one-time reset.
-        objectWillChange.send()
-        self.defaults.set(false, forKey: Keys.onboardingCompleted)
-        self.defaults.set(0, forKey: Keys.onboardingCurrentStep)
-        self.defaults.set(false, forKey: Keys.onboardingAISkipped)
-        self.defaults.set(false, forKey: Keys.onboardingPlaygroundValidated)
-        self.defaults.set(false, forKey: Keys.onboardingPlaygroundSkipped)
-        self.defaults.set(Self.currentOnboardingGeneration, forKey: Keys.onboardingGeneration)
-    }
-
     var onboardingCompleted: Bool {
         get {
             if self.defaults.object(forKey: Keys.onboardingCompleted) == nil {
@@ -2131,7 +2502,8 @@ final class SettingsStore: ObservableObject {
             objectWillChange.send()
             self.defaults.set(newValue, forKey: Keys.onboardingCompleted)
             if newValue {
-                self.defaults.set(Self.currentOnboardingGeneration, forKey: Keys.onboardingGeneration)
+                self.defaults.set(false, forKey: Keys.manualOnboardingResetRequested)
+                self.defaults.removeObject(forKey: Keys.manualOnboardingResetRequestedAt)
             }
         }
     }
@@ -2214,6 +2586,10 @@ final class SettingsStore: ObservableObject {
         !self.onboardingCompleted
     }
 
+    var analyticsOnboardingOrigin: AnalyticsOnboardingOrigin {
+        self.defaults.bool(forKey: Keys.manualOnboardingResetRequested) ? .manualRestart : .firstRun
+    }
+
     var shouldPromptAccessibilityOnLaunch: Bool {
         !self.shouldShowOnboarding
     }
@@ -2246,13 +2622,39 @@ final class SettingsStore: ObservableObject {
     func resetOnboardingProgress() {
         objectWillChange.send()
         self.defaults.set(false, forKey: Keys.onboardingCompleted)
-        self.defaults.set(Self.currentOnboardingGeneration, forKey: Keys.onboardingGeneration)
+        self.defaults.set(true, forKey: Keys.manualOnboardingResetRequested)
+        self.defaults.set(Date(), forKey: Keys.manualOnboardingResetRequestedAt)
         self.defaults.set(0, forKey: Keys.onboardingCurrentStep)
         self.defaults.set(false, forKey: Keys.onboardingAISkipped)
         self.defaults.set(false, forKey: Keys.onboardingPlaygroundValidated)
         self.defaults.set(false, forKey: Keys.onboardingPlaygroundSkipped)
         self.defaults.set("en", forKey: Keys.onboardingSelectedLanguageID)
         self.defaults.set(false, forKey: Keys.playgroundUsed)
+    }
+
+    private func repairForcedOnboardingResetIfNeeded() {
+        // 1.6.2 briefly used OnboardingGeneration to force every install through onboarding.
+        // Restore existing users who were reset by that migration while keeping fresh installs intact.
+        let hadOpenedBeforeForcedReset = AnalyticsIdentityStore.shared.firstOpenAt.map {
+            $0 < Self.forcedOnboardingResetIntroducedAt
+        } ?? false
+        let hasExistingInstallSignal = self.hasLegacyUsageSignals() || hadOpenedBeforeForcedReset
+        let hasCurrentManualReset = self.defaults.bool(forKey: Keys.manualOnboardingResetRequested)
+            && self.defaults.object(forKey: Keys.manualOnboardingResetRequestedAt) != nil
+        guard self.defaults.object(forKey: Keys.onboardingGeneration) != nil,
+              self.defaults.bool(forKey: Keys.onboardingCompleted) == false,
+              !hasCurrentManualReset,
+              hasExistingInstallSignal
+        else { return }
+
+        objectWillChange.send()
+        self.defaults.set(true, forKey: Keys.onboardingCompleted)
+        self.defaults.set(false, forKey: Keys.manualOnboardingResetRequested)
+        self.defaults.removeObject(forKey: Keys.manualOnboardingResetRequestedAt)
+        self.defaults.set(0, forKey: Keys.onboardingCurrentStep)
+        self.defaults.set(false, forKey: Keys.onboardingAISkipped)
+        self.defaults.set(false, forKey: Keys.onboardingPlaygroundValidated)
+        self.defaults.set(false, forKey: Keys.onboardingPlaygroundSkipped)
     }
 
     private func hasLegacyUsageSignals() -> Bool {
@@ -2395,6 +2797,43 @@ final class SettingsStore: ObservableObject {
             objectWillChange.send()
             if let data = try? JSONEncoder().encode(newValue) {
                 self.defaults.set(data, forKey: Keys.cancelRecordingHotkeyShortcut)
+            }
+        }
+    }
+
+    // MARK: - Paste Last Transcription Settings
+
+    /// Whether the "Paste Last Transcription" global hotkey is active. Opt-in and off by default.
+    var pasteLastTranscriptionShortcutEnabled: Bool {
+        get {
+            let value = self.defaults.object(forKey: Keys.pasteLastTranscriptionShortcutEnabled)
+            return value as? Bool ?? false
+        }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.pasteLastTranscriptionShortcutEnabled)
+        }
+    }
+
+    /// The shortcut that re-inserts the most recent transcription into the focused field.
+    /// Unbound (nil) by default so it never collides with an existing shortcut until the user assigns one.
+    var pasteLastTranscriptionHotkeyShortcut: HotkeyShortcut? {
+        get {
+            if let data = defaults.data(forKey: Keys.pasteLastTranscriptionHotkeyShortcut),
+               let shortcut = try? JSONDecoder().decode(HotkeyShortcut.self, from: data)
+            {
+                return shortcut
+            }
+            return nil
+        }
+        set {
+            objectWillChange.send()
+            guard let newValue else {
+                self.defaults.removeObject(forKey: Keys.pasteLastTranscriptionHotkeyShortcut)
+                return
+            }
+            if let data = try? JSONEncoder().encode(newValue) {
+                self.defaults.set(data, forKey: Keys.pasteLastTranscriptionHotkeyShortcut)
             }
         }
     }
@@ -2554,24 +2993,36 @@ final class SettingsStore: ObservableObject {
 
     /// Global check if a model is a reasoning model (requires special params/max_completion_tokens)
     func isReasoningModel(_ model: String) -> Bool {
-        let modelLower = model.lowercased()
+        // Drop a provider/namespace prefix (e.g. OpenRouter's "openai/") so the
+        // family checks below match prefixed reasoning IDs like "openai/o3"
+        // without also matching every non-reasoning "openai/*" model (e.g.
+        // "openai/gpt-4o"), which would strip its temperature control.
+        var modelLower = model.lowercased()
+        if let slash = modelLower.firstIndex(of: "/") {
+            modelLower = String(modelLower[modelLower.index(after: slash)...])
+        }
         return modelLower.hasPrefix("gpt-5") ||
             modelLower.contains("gpt-5.") ||
             modelLower.hasPrefix("o1") ||
             modelLower.hasPrefix("o3") ||
             modelLower.hasPrefix("o4") ||
             modelLower.contains("gpt-oss") ||
-            modelLower.hasPrefix("openai/") ||
             (modelLower.contains("deepseek") && modelLower.contains("reasoner"))
     }
 
     /// Whether the model rejects the `temperature` parameter.
     /// Covers reasoning models plus Anthropic models that have deprecated temperature
-    /// (Claude Opus 4.7+, which use extended thinking by default).
+    /// (Opus 4.7+, Sonnet 5, Fable/Mythos 5 — Sonnet 4.6 and older still accept it).
     func isTemperatureUnsupported(_ model: String) -> Bool {
         if self.isReasoningModel(model) { return true }
-        let modelLower = model.lowercased()
+        // Normalize version separators so dotted IDs (e.g. OpenRouter's
+        // anthropic/claude-opus-4.8) match the hyphenated forms below.
+        let modelLower = model.lowercased().replacingOccurrences(of: ".", with: "-")
         return modelLower.contains("claude-opus-4-7")
+            || modelLower.contains("claude-opus-4-8")
+            || modelLower.contains("claude-sonnet-5")
+            || modelLower.contains("claude-fable")
+            || modelLower.contains("claude-mythos")
     }
 
     /// Whether to display thinking tokens in the UI (Command Mode, Rewrite Mode)
@@ -2696,6 +3147,18 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Whether transient microphone selection and availability alerts are shown.
+    var showMicrophoneChangeAlerts: Bool {
+        get {
+            let value = self.defaults.object(forKey: Keys.showMicrophoneChangeAlerts)
+            return value as? Bool ?? true
+        }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.showMicrophoneChangeAlerts)
+        }
+    }
+
     func makeBackupPayload() -> SettingsBackupPayload {
         SettingsBackupPayload(
             selectedProviderID: self.selectedProviderID,
@@ -2703,6 +3166,9 @@ final class SettingsStore: ObservableObject {
             savedProviders: self.savedProviders,
             modelReasoningConfigs: self.modelReasoningConfigs,
             privateAIPrefixKVCacheEnabled: self.privateAIPrefixKVCacheEnabled,
+            privateAIBoostEnabled: self.privateAIBoostEnabled,
+            privateAIBackendPreference: self.privateAIBackendPreference,
+            privateAIContextTokenLimit: self.privateAIContextTokenLimit,
             selectedSpeechModel: self.selectedSpeechModel,
             selectedCohereLanguage: self.selectedCohereLanguage,
             selectedNemotronLanguage: self.selectedNemotronLanguage,
@@ -2725,6 +3191,8 @@ final class SettingsStore: ObservableObject {
             rewriteModeSelectedProviderID: self.rewriteModeSelectedProviderID,
             rewriteModeLinkedToGlobal: self.rewriteModeLinkedToGlobal,
             cancelRecordingHotkeyShortcut: self.cancelRecordingHotkeyShortcut,
+            pasteLastTranscriptionHotkeyShortcut: self.pasteLastTranscriptionHotkeyShortcut,
+            pasteLastTranscriptionShortcutEnabled: self.pasteLastTranscriptionShortcutEnabled,
             showThinkingTokens: self.showThinkingTokens,
             hideFromDockAndAppSwitcher: self.hideFromDockAndAppSwitcher,
             showMainWindowAtLoginLaunch: self.showMainWindowAtLoginLaunch,
@@ -2739,11 +3207,17 @@ final class SettingsStore: ObservableObject {
             pressAndHoldMode: self.pressAndHoldMode,
             hotkeyMode: self.hotkeyMode,
             enableStreamingPreview: self.enableStreamingPreview,
+            skipSilentRecordingsEnabled: self.skipSilentRecordingsEnabled,
             enableAIStreaming: self.enableAIStreaming,
             copyTranscriptionToClipboard: self.copyTranscriptionToClipboard,
             textInsertionMode: self.textInsertionMode,
             preferredInputDeviceUID: self.preferredInputDeviceUID,
+            microphonePriority: self.microphonePriority,
+            suppressedMicrophoneUIDs: self.suppressedMicrophoneUIDs.sorted(),
             preferredOutputDeviceUID: self.preferredOutputDeviceUID,
+            // Kept in the backup schema for compatibility with older builds.
+            // Current builds always resolve microphones from the priority list.
+            microphoneSelectionMode: .manual,
             visualizerNoiseThreshold: self.visualizerNoiseThreshold,
             overlayPosition: self.overlayPosition,
             overlayBottomOffset: self.overlayBottomOffset,
@@ -2754,9 +3228,15 @@ final class SettingsStore: ObservableObject {
             saveAudioWithTranscriptionHistory: self.saveAudioWithTranscriptionHistory,
             audioHistoryBudgetGB: self.audioHistoryBudgetGB,
             notifyAIProcessingFailures: self.notifyAIProcessingFailures,
+            showMicrophoneChangeAlerts: self.showMicrophoneChangeAlerts,
             weekendsDontBreakStreak: self.weekendsDontBreakStreak,
             fillerWords: self.fillerWords,
             removeFillerWordsEnabled: self.removeFillerWordsEnabled,
+            autoConvertPunctuationEnabled: self.autoConvertPunctuationEnabled,
+            literalDictationFormattingEnabled: self.literalDictationFormattingEnabled,
+            punctuationDictionaryPrefix: self.punctuationDictionaryPrefix,
+            punctuationDictionaryRules: self.punctuationDictionaryRules,
+            spokenFormattingActionRules: self.spokenFormattingActionRules,
             gaavModeEnabled: self.gaavModeEnabled,
             gaavLowercaseFirstLetterEnabled: self.gaavLowercaseFirstLetterEnabled,
             gaavRemoveTrailingPeriodEnabled: self.gaavRemoveTrailingPeriodEnabled,
@@ -2764,6 +3244,8 @@ final class SettingsStore: ObservableObject {
             continuousDictationSpacingEnabled: self.continuousDictationSpacingEnabled,
             contextAwareCapitalizationEnabled: self.contextAwareCapitalizationEnabled,
             pauseMediaDuringTranscription: self.pauseMediaDuringTranscription,
+            automaticDictionaryLearningEnabled: self.automaticDictionaryLearningEnabled,
+            pronunciationMatchingEnabled: self.pronunciationMatchingEnabled,
             vocabularyBoostingEnabled: self.vocabularyBoostingEnabled,
             customDictionaryEntries: self.customDictionaryEntries,
             selectedDictationPromptID: self.selectedDictationPromptID,
@@ -2773,7 +3255,9 @@ final class SettingsStore: ObservableObject {
             selectedEditPromptID: self.selectedEditPromptID,
             editPromptRoutingScope: self.editPromptRoutingScope,
             defaultDictationPromptOverride: self.defaultDictationPromptOverride,
-            defaultEditPromptOverride: self.defaultEditPromptOverride
+            defaultEditPromptOverride: self.defaultEditPromptOverride,
+            fileTranscriptionSpeakerLabelsEnabled: self.fileTranscriptionSpeakerLabelsEnabled,
+            fileTranscriptionExpectedSpeakerCount: self.fileTranscriptionExpectedSpeakerCount
         )
     }
 
@@ -2792,6 +3276,15 @@ final class SettingsStore: ObservableObject {
         self.modelReasoningConfigs = payload.modelReasoningConfigs
         if let privateAIPrefixKVCacheEnabled = payload.privateAIPrefixKVCacheEnabled {
             self.privateAIPrefixKVCacheEnabled = privateAIPrefixKVCacheEnabled
+        }
+        if let privateAIBoostEnabled = payload.privateAIBoostEnabled {
+            self.privateAIBoostEnabled = privateAIBoostEnabled
+        }
+        if let privateAIBackendPreference = payload.privateAIBackendPreference {
+            self.privateAIBackendPreference = privateAIBackendPreference
+        }
+        if let privateAIContextTokenLimit = payload.privateAIContextTokenLimit {
+            self.privateAIContextTokenLimit = privateAIContextTokenLimit
         }
         self.selectedSpeechModel = payload.selectedSpeechModel
         self.selectedCohereLanguage = payload.selectedCohereLanguage
@@ -2816,6 +3309,14 @@ final class SettingsStore: ObservableObject {
         self.rewriteModeSelectedProviderID = payload.rewriteModeSelectedProviderID
         self.rewriteModeLinkedToGlobal = payload.rewriteModeLinkedToGlobal
         self.cancelRecordingHotkeyShortcut = payload.cancelRecordingHotkeyShortcut
+        // Both guarded so restoring an older backup (which predates these fields) doesn't wipe a
+        // currently-configured shortcut or leave the feature enabled with no shortcut bound.
+        if let pasteLastTranscriptionHotkeyShortcut = payload.pasteLastTranscriptionHotkeyShortcut {
+            self.pasteLastTranscriptionHotkeyShortcut = pasteLastTranscriptionHotkeyShortcut
+        }
+        if let pasteLastTranscriptionShortcutEnabled = payload.pasteLastTranscriptionShortcutEnabled {
+            self.pasteLastTranscriptionShortcutEnabled = pasteLastTranscriptionShortcutEnabled
+        }
         self.showThinkingTokens = payload.showThinkingTokens
         self.hideFromDockAndAppSwitcher = payload.hideFromDockAndAppSwitcher
         self.showMainWindowAtLoginLaunch = payload.showMainWindowAtLoginLaunch ?? true
@@ -2829,11 +3330,29 @@ final class SettingsStore: ObservableObject {
         self.shareAnonymousAnalytics = payload.shareAnonymousAnalytics
         self.hotkeyMode = payload.hotkeyMode ?? (payload.pressAndHoldMode ? .hold : .toggle)
         self.enableStreamingPreview = payload.enableStreamingPreview
+        if let skipSilentRecordingsEnabled = payload.skipSilentRecordingsEnabled {
+            self.skipSilentRecordingsEnabled = skipSilentRecordingsEnabled
+        }
         self.enableAIStreaming = payload.enableAIStreaming
         self.copyTranscriptionToClipboard = payload.copyTranscriptionToClipboard
         self.textInsertionMode = payload.textInsertionMode
         self.preferredInputDeviceUID = payload.preferredInputDeviceUID
+        self.suppressedMicrophoneUIDs = Set(payload.suppressedMicrophoneUIDs ?? [])
+        if let microphonePriority = payload.microphonePriority {
+            self.microphonePriority = microphonePriority
+        } else {
+            self.microphonePriority = []
+        }
         self.preferredOutputDeviceUID = payload.preferredOutputDeviceUID
+        if payload.microphonePriority != nil {
+            self.microphoneSelectionMode = .manual
+            self.microphoneSelectionMigrationVersion = Self.microphonePriorityMigrationVersion
+        } else if payload.microphoneSelectionMode == .system {
+            self.microphoneSelectionMode = .system
+            self.microphoneSelectionMigrationVersion = 0
+        } else {
+            self.microphoneSelectionMode = .manual
+        }
         self.visualizerNoiseThreshold = payload.visualizerNoiseThreshold
         self.overlayPosition = payload.overlayPosition
         self.overlayBottomOffset = payload.overlayBottomOffset
@@ -2850,9 +3369,27 @@ final class SettingsStore: ObservableObject {
         if let notifyAIProcessingFailures = payload.notifyAIProcessingFailures {
             self.notifyAIProcessingFailures = notifyAIProcessingFailures
         }
+        if let showMicrophoneChangeAlerts = payload.showMicrophoneChangeAlerts {
+            self.showMicrophoneChangeAlerts = showMicrophoneChangeAlerts
+        }
         self.weekendsDontBreakStreak = payload.weekendsDontBreakStreak
         self.fillerWords = payload.fillerWords
         self.removeFillerWordsEnabled = payload.removeFillerWordsEnabled
+        if let autoConvertPunctuationEnabled = payload.autoConvertPunctuationEnabled {
+            self.autoConvertPunctuationEnabled = autoConvertPunctuationEnabled
+        }
+        if let literalDictationFormattingEnabled = payload.literalDictationFormattingEnabled {
+            self.literalDictationFormattingEnabled = literalDictationFormattingEnabled
+        }
+        if let punctuationDictionaryPrefix = payload.punctuationDictionaryPrefix {
+            self.punctuationDictionaryPrefix = punctuationDictionaryPrefix
+        }
+        if let punctuationDictionaryRules = payload.punctuationDictionaryRules {
+            self.punctuationDictionaryRules = punctuationDictionaryRules
+        }
+        if let spokenFormattingActionRules = payload.spokenFormattingActionRules {
+            self.spokenFormattingActionRules = spokenFormattingActionRules
+        }
         let restoredGaavModeEnabled = payload.gaavModeEnabled
         let restoredContinuousDictationModeEnabled = payload.continuousDictationModeEnabled ?? false
         self.gaavModeEnabled = restoredGaavModeEnabled
@@ -2862,6 +3399,12 @@ final class SettingsStore: ObservableObject {
         self.continuousDictationSpacingEnabled = payload.continuousDictationSpacingEnabled ?? restoredContinuousDictationModeEnabled
         self.contextAwareCapitalizationEnabled = payload.contextAwareCapitalizationEnabled ?? restoredContinuousDictationModeEnabled
         self.pauseMediaDuringTranscription = payload.pauseMediaDuringTranscription
+        if let automaticDictionaryLearningEnabled = payload.automaticDictionaryLearningEnabled {
+            self.automaticDictionaryLearningEnabled = automaticDictionaryLearningEnabled
+        }
+        if let pronunciationMatchingEnabled = payload.pronunciationMatchingEnabled {
+            self.pronunciationMatchingEnabled = pronunciationMatchingEnabled
+        }
         self.vocabularyBoostingEnabled = payload.vocabularyBoostingEnabled
         self.customDictionaryEntries = payload.customDictionaryEntries
 
@@ -2875,9 +3418,16 @@ final class SettingsStore: ObservableObject {
         self.selectedEditPromptID = payload.selectedEditPromptID
         self.defaultDictationPromptOverride = payload.defaultDictationPromptOverride
         self.defaultEditPromptOverride = payload.defaultEditPromptOverride
+        if let fileTranscriptionSpeakerLabelsEnabled = payload.fileTranscriptionSpeakerLabelsEnabled {
+            self.fileTranscriptionSpeakerLabelsEnabled = fileTranscriptionSpeakerLabelsEnabled
+        }
+        if let fileTranscriptionExpectedSpeakerCount = payload.fileTranscriptionExpectedSpeakerCount {
+            self.fileTranscriptionExpectedSpeakerCount = fileTranscriptionExpectedSpeakerCount
+        }
         self.promptModeSelectedPromptID = payload.promptModeSelectedPromptID
         self.isSecondaryDictationPromptOff = payload.secondaryDictationPromptOff ?? false
         self.normalizePromptSelectionsIfNeeded()
+        self.purgeRetiredAppleIntelligenceState()
     }
 
     // MARK: - Private Methods
@@ -3238,11 +3788,6 @@ final class SettingsStore: ObservableObject {
         let trimmed = providerID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
 
-        if trimmed == "apple-intelligence" {
-            return AppleIntelligenceService.isAvailable &&
-                self.verifiedProviderFingerprints[self.canonicalProviderKey(for: trimmed)] == "apple-intelligence"
-        }
-
         if PrivateFeatures.privateAIProvider,
            trimmed == PrivateAIProviderFeature.shared.providerID
         {
@@ -3328,6 +3873,24 @@ final class SettingsStore: ObservableObject {
         }
 
         return ModelRepository.shared.defaultModels(for: providerID).first
+    }
+
+    func analyticsAIModelDescriptor(for mode: AnalyticsUsageMode) -> AnalyticsModelDescriptor? {
+        let providerID: String
+        let selectedModel: String?
+        switch mode {
+        case .edit:
+            providerID = self.rewriteModeLinkedToGlobal ? self.selectedProviderID : self.rewriteModeSelectedProviderID
+            selectedModel = self.rewriteModeLinkedToGlobal ? self.modelSelection(for: providerID) : self.rewriteModeSelectedModel
+        case .command:
+            providerID = self.commandModeLinkedToGlobal ? self.selectedProviderID : self.commandModeSelectedProviderID
+            selectedModel = self.commandModeLinkedToGlobal ? self.modelSelection(for: providerID) : self.commandModeSelectedModel
+        case .dictation, .meeting:
+            providerID = self.selectedProviderID
+            selectedModel = self.modelSelection(for: providerID)
+        }
+        guard !providerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return AnalyticsModelDescriptor(provider: providerID, model: selectedModel ?? "unknown")
     }
 
     private func availableSelectedProviderID(for rawValue: String?) -> String {
@@ -3453,6 +4016,297 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    var autoConvertPunctuationEnabled: Bool {
+        get { self.defaults.object(forKey: Keys.autoConvertPunctuationEnabled) as? Bool ?? true }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.autoConvertPunctuationEnabled)
+        }
+    }
+
+    var literalDictationFormattingEnabled: Bool {
+        get { self.defaults.object(forKey: Keys.literalDictationFormattingEnabled) as? Bool ?? false }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.literalDictationFormattingEnabled)
+        }
+    }
+
+    static let defaultPunctuationDictionaryPrefix = "literal"
+
+    enum SpokenFormattingAction: String, Codable, CaseIterable, Identifiable {
+        case newLine
+        case newParagraph
+        case tab
+        case space
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .newLine: return "New Line"
+            case .newParagraph: return "New Paragraph"
+            case .tab: return "Tab"
+            case .space: return "Space"
+            }
+        }
+
+        var displaySymbol: String {
+            switch self {
+            case .newLine: return "⏎"
+            case .newParagraph: return "¶"
+            case .tab: return "⇥"
+            case .space: return "␣"
+            }
+        }
+
+        var output: String {
+            switch self {
+            case .newLine: return "\n"
+            case .newParagraph: return "\n\n"
+            case .tab: return "\t"
+            case .space: return " "
+            }
+        }
+    }
+
+    struct SpokenFormattingActionRule: Codable, Identifiable, Hashable {
+        var action: SpokenFormattingAction
+        var aliases: [String]
+        var isEnabled: Bool
+
+        var id: SpokenFormattingAction { self.action }
+
+        init(action: SpokenFormattingAction, aliases: [String], isEnabled: Bool = true) {
+            self.action = action
+            self.aliases = PunctuationDictionaryRule.normalizedAliases(aliases)
+            self.isEnabled = isEnabled && !self.aliases.isEmpty
+        }
+    }
+
+    static let defaultSpokenFormattingActionRules: [SpokenFormattingActionRule] = [
+        SpokenFormattingActionRule(action: .newLine, aliases: ["new line", "next line"]),
+        SpokenFormattingActionRule(action: .newParagraph, aliases: ["new paragraph", "next paragraph"]),
+        SpokenFormattingActionRule(action: .tab, aliases: ["tab"]),
+        SpokenFormattingActionRule(action: .space, aliases: ["space"]),
+    ]
+
+    static let defaultPunctuationDictionaryRules: [PunctuationDictionaryRule] = [
+        PunctuationDictionaryRule(aliases: ["comma"], symbol: ","),
+        PunctuationDictionaryRule(aliases: ["period", "full stop"], symbol: "."),
+        PunctuationDictionaryRule(aliases: ["dot"], symbol: "."),
+        PunctuationDictionaryRule(aliases: ["question mark", "questionmark"], symbol: "?"),
+        PunctuationDictionaryRule(aliases: ["exclamation mark", "exclamation point", "bang"], symbol: "!"),
+        PunctuationDictionaryRule(aliases: ["colon"], symbol: ":"),
+        PunctuationDictionaryRule(aliases: ["semicolon", "semi colon"], symbol: ";"),
+        PunctuationDictionaryRule(aliases: ["ellipsis", "dot dot dot", "three dots"], symbol: "..."),
+        PunctuationDictionaryRule(aliases: ["slash", "forward slash", "forwardslash"], symbol: "/"),
+        PunctuationDictionaryRule(aliases: ["backslash", "back slash"], symbol: "\\"),
+        PunctuationDictionaryRule(aliases: ["hyphen"], symbol: "-"),
+        PunctuationDictionaryRule(aliases: ["dash", "minus sign"], symbol: "-"),
+        PunctuationDictionaryRule(aliases: ["em dash", "long dash"], symbol: "—"),
+        PunctuationDictionaryRule(aliases: ["en dash"], symbol: "–"),
+        PunctuationDictionaryRule(
+            aliases: ["open parenthesis", "open parentheses", "left parenthesis", "left parentheses", "open paren", "left paren"],
+            symbol: "("
+        ),
+        PunctuationDictionaryRule(
+            aliases: ["close parenthesis", "close parentheses", "right parenthesis", "right parentheses", "close paren", "right paren"],
+            symbol: ")"
+        ),
+        PunctuationDictionaryRule(aliases: ["open bracket", "left bracket", "open square bracket", "left square bracket"], symbol: "["),
+        PunctuationDictionaryRule(aliases: ["close bracket", "right bracket", "close square bracket", "right square bracket"], symbol: "]"),
+        PunctuationDictionaryRule(
+            aliases: ["open brace", "left brace", "open curly brace", "left curly brace", "open curly bracket", "left curly bracket"],
+            symbol: "{"
+        ),
+        PunctuationDictionaryRule(
+            aliases: ["close brace", "right brace", "close curly brace", "right curly brace", "close curly bracket", "right curly bracket"],
+            symbol: "}"
+        ),
+        PunctuationDictionaryRule(aliases: ["open angle bracket", "left angle bracket", "less than sign"], symbol: "<"),
+        PunctuationDictionaryRule(aliases: ["close angle bracket", "right angle bracket", "greater than sign"], symbol: ">"),
+        PunctuationDictionaryRule(aliases: ["quote", "quotes", "quotation mark", "double quote"], symbol: "\""),
+        PunctuationDictionaryRule(aliases: ["open quote", "opening quote", "open double quote", "opening double quote"], symbol: "\""),
+        PunctuationDictionaryRule(aliases: ["close quote", "closing quote", "close double quote", "closing double quote"], symbol: "\""),
+        PunctuationDictionaryRule(aliases: ["single quote"], symbol: "'"),
+        PunctuationDictionaryRule(aliases: ["apostrophe"], symbol: "'"),
+        PunctuationDictionaryRule(aliases: ["at the rate", "at sign", "commercial at"], symbol: "@"),
+        PunctuationDictionaryRule(aliases: ["ampersand", "and sign"], symbol: "&"),
+        PunctuationDictionaryRule(aliases: ["plus sign", "plus"], symbol: "+"),
+        PunctuationDictionaryRule(aliases: ["equals sign", "equal sign", "equal", "equals"], symbol: "="),
+        PunctuationDictionaryRule(aliases: ["percent sign", "percentage sign", "percent"], symbol: "%"),
+        PunctuationDictionaryRule(aliases: ["dollar sign", "dollar"], symbol: "$"),
+        PunctuationDictionaryRule(aliases: ["hash", "hash sign", "hashtag", "pound sign", "number sign"], symbol: "#"),
+        PunctuationDictionaryRule(aliases: ["asterisk", "star symbol"], symbol: "*"),
+        PunctuationDictionaryRule(aliases: ["underscore"], symbol: "_"),
+        PunctuationDictionaryRule(aliases: ["pipe", "vertical bar"], symbol: "|"),
+        PunctuationDictionaryRule(aliases: ["tilde"], symbol: "~"),
+        PunctuationDictionaryRule(aliases: ["caret"], symbol: "^"),
+        PunctuationDictionaryRule(aliases: ["backtick", "back tick"], symbol: "`"),
+    ]
+
+    struct PunctuationDictionaryRule: Codable, Identifiable, Hashable {
+        let id: UUID
+        var aliases: [String]
+        var symbol: String
+
+        init(aliases: [String], symbol: String) {
+            self.id = UUID()
+            self.aliases = Self.normalizedAliases(aliases)
+            self.symbol = Self.normalizedSymbol(symbol) ?? symbol
+        }
+
+        init(id: UUID, aliases: [String], symbol: String) {
+            self.id = id
+            self.aliases = Self.normalizedAliases(aliases)
+            self.symbol = Self.normalizedSymbol(symbol) ?? symbol
+        }
+
+        static func normalizedAlias(_ value: String) -> String? {
+            let alias = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return alias.isEmpty ? nil : alias
+        }
+
+        static func normalizedAliases(_ values: [String]) -> [String] {
+            var seen: Set<String> = []
+            var aliases: [String] = []
+            aliases.reserveCapacity(values.count)
+
+            for value in values {
+                guard let alias = self.normalizedAlias(value), !seen.contains(alias) else { continue }
+                seen.insert(alias)
+                aliases.append(alias)
+            }
+
+            return aliases
+        }
+
+        static func normalizedSymbol(_ value: String) -> String? {
+            let symbol = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return symbol.isEmpty ? nil : symbol
+        }
+    }
+
+    static func normalizedPunctuationDictionaryPrefix(_ value: String) -> String? {
+        let prefix = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return prefix.isEmpty ? nil : prefix
+    }
+
+    var punctuationDictionaryPrefix: String {
+        get {
+            guard let stored = self.defaults.string(forKey: Keys.punctuationDictionaryPrefix),
+                  let normalized = Self.normalizedPunctuationDictionaryPrefix(stored)
+            else {
+                return Self.defaultPunctuationDictionaryPrefix
+            }
+            return normalized
+        }
+        set {
+            objectWillChange.send()
+            self.defaults.set(
+                Self.normalizedPunctuationDictionaryPrefix(newValue) ?? Self.defaultPunctuationDictionaryPrefix,
+                forKey: Keys.punctuationDictionaryPrefix
+            )
+        }
+    }
+
+    var punctuationDictionaryRules: [PunctuationDictionaryRule] {
+        get {
+            guard let data = defaults.data(forKey: Keys.punctuationDictionaryRules),
+                  let decoded = try? JSONDecoder().decode([PunctuationDictionaryRule].self, from: data)
+            else {
+                return Self.defaultPunctuationDictionaryRules
+            }
+            return decoded.compactMap { rule in
+                let aliases = PunctuationDictionaryRule.normalizedAliases(rule.aliases)
+                guard !aliases.isEmpty,
+                      let symbol = PunctuationDictionaryRule.normalizedSymbol(rule.symbol)
+                else {
+                    return nil
+                }
+                return PunctuationDictionaryRule(id: rule.id, aliases: aliases, symbol: symbol)
+            }
+        }
+        set {
+            objectWillChange.send()
+            let normalizedRules = newValue.compactMap { rule -> PunctuationDictionaryRule? in
+                let aliases = PunctuationDictionaryRule.normalizedAliases(rule.aliases)
+                guard !aliases.isEmpty,
+                      let symbol = PunctuationDictionaryRule.normalizedSymbol(rule.symbol)
+                else {
+                    return nil
+                }
+                return PunctuationDictionaryRule(id: rule.id, aliases: aliases, symbol: symbol)
+            }
+            if let encoded = try? JSONEncoder().encode(normalizedRules) {
+                self.defaults.set(encoded, forKey: Keys.punctuationDictionaryRules)
+            }
+        }
+    }
+
+    var spokenFormattingActionRules: [SpokenFormattingActionRule] {
+        get {
+            guard let data = defaults.data(forKey: Keys.spokenFormattingActionRules),
+                  let decoded = try? JSONDecoder().decode([SpokenFormattingActionRule].self, from: data)
+            else {
+                return Self.defaultSpokenFormattingActionRules
+            }
+
+            var rulesByAction: [SpokenFormattingAction: SpokenFormattingActionRule] = [:]
+            for rule in decoded where rulesByAction[rule.action] == nil {
+                rulesByAction[rule.action] = rule
+            }
+            let orderedRules = SpokenFormattingAction.allCases.map { action in
+                guard let rule = rulesByAction[action] else {
+                    return Self.defaultSpokenFormattingActionRules.first { $0.action == action }
+                        ?? SpokenFormattingActionRule(action: action, aliases: [], isEnabled: false)
+                }
+                return SpokenFormattingActionRule(
+                    action: action,
+                    aliases: rule.aliases,
+                    isEnabled: rule.isEnabled
+                )
+            }
+            return self.removingDuplicateSpokenFormattingAliases(from: orderedRules)
+        }
+        set {
+            objectWillChange.send()
+            var rulesByAction: [SpokenFormattingAction: SpokenFormattingActionRule] = [:]
+            for rule in newValue where rulesByAction[rule.action] == nil {
+                rulesByAction[rule.action] = rule
+            }
+            let orderedRules = SpokenFormattingAction.allCases.map { action in
+                guard let rule = rulesByAction[action] else {
+                    return SpokenFormattingActionRule(action: action, aliases: [], isEnabled: false)
+                }
+                return SpokenFormattingActionRule(
+                    action: action,
+                    aliases: rule.aliases,
+                    isEnabled: rule.isEnabled
+                )
+            }
+            let normalizedRules = self.removingDuplicateSpokenFormattingAliases(from: orderedRules)
+            if let encoded = try? JSONEncoder().encode(normalizedRules) {
+                self.defaults.set(encoded, forKey: Keys.spokenFormattingActionRules)
+            }
+        }
+    }
+
+    private func removingDuplicateSpokenFormattingAliases(
+        from rules: [SpokenFormattingActionRule]
+    ) -> [SpokenFormattingActionRule] {
+        var claimedAliases = Set(self.punctuationDictionaryRules.flatMap(\.aliases))
+        return rules.map { rule in
+            let uniqueAliases = rule.aliases.filter { claimedAliases.insert($0).inserted }
+            return SpokenFormattingActionRule(
+                action: rule.action,
+                aliases: uniqueAliases,
+                isEnabled: rule.isEnabled
+            )
+        }
+    }
+
     // MARK: - GAAV Mode
 
     /// Legacy combined GAAV setting. New behavior uses the split formatting toggles below.
@@ -3553,6 +4407,13 @@ final class SettingsStore: ObservableObject {
             self.triggers = triggers.map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
             self.replacement = replacement
         }
+
+        /// Trims padding around visible replacement text while preserving an intentional
+        /// all-whitespace payload such as a newline, space, or tab.
+        static func sanitizedReplacement(_ text: String) -> String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? text : trimmed
+        }
     }
 
     var vocabularyBoostingEnabled: Bool {
@@ -3564,6 +4425,22 @@ final class SettingsStore: ObservableObject {
             objectWillChange.send()
             self.defaults.set(newValue, forKey: Keys.vocabularyBoostingEnabled)
             NotificationCenter.default.post(name: .parakeetVocabularyDidChange, object: nil)
+        }
+    }
+
+    var automaticDictionaryLearningEnabled: Bool {
+        get { self.defaults.object(forKey: Keys.automaticDictionaryLearningEnabled) as? Bool ?? true }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.automaticDictionaryLearningEnabled)
+        }
+    }
+
+    var pronunciationMatchingEnabled: Bool {
+        get { self.defaults.object(forKey: Keys.pronunciationMatchingEnabled) as? Bool ?? false }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.pronunciationMatchingEnabled)
         }
     }
 
@@ -3616,7 +4493,7 @@ final class SettingsStore: ObservableObject {
         case whisperBase = "whisper-base"
         case whisperSmall = "whisper-small"
         case whisperMedium = "whisper-medium"
-        case whisperLargeTurbo = "whisper-large-turbo" // temporarily disabled in UI
+        case whisperLargeTurbo = "whisper-large-turbo"
         case whisperLarge = "whisper-large"
 
         var id: String {
@@ -3641,7 +4518,7 @@ final class SettingsStore: ObservableObject {
             case .whisperBase: return "Whisper Base"
             case .whisperSmall: return "Whisper Small"
             case .whisperMedium: return "Whisper Medium"
-            case .whisperLargeTurbo: return "Whisper Large Turbo (Disabled)"
+            case .whisperLargeTurbo: return "Whisper Large Turbo"
             case .whisperLarge: return "Whisper Large"
             }
         }
@@ -3674,12 +4551,12 @@ final class SettingsStore: ObservableObject {
             case .nemotronStreaming320: return "~668.2 MiB"
             case .appleSpeech: return "Built-in"
             case .appleSpeechAnalyzer: return "Built-in"
-            case .whisperTiny: return "~74.1 MiB"
-            case .whisperBase: return "~141.1 MiB"
-            case .whisperSmall: return "~465.0 MiB"
-            case .whisperMedium: return "~1.43 GiB"
-            case .whisperLargeTurbo: return "~1.51 GiB"
-            case .whisperLarge: return "~2.88 GiB"
+            case .whisperTiny: return "~43.9 MiB"
+            case .whisperBase: return "~81.0 MiB"
+            case .whisperSmall: return "~257.3 MiB"
+            case .whisperMedium: return "~793.0 MiB"
+            case .whisperLargeTurbo: return "~845.3 MiB"
+            case .whisperLarge: return "~1.55 GiB"
             }
         }
 
@@ -3692,12 +4569,12 @@ final class SettingsStore: ObservableObject {
             case .cohereTranscribeSixBit: return 1_650_748_785
             case .nemotronOffline: return 556_552_620
             case .nemotronStreaming, .nemotronStreaming320: return 700_685_415
-            case .whisperTiny: return 77_691_713
-            case .whisperBase: return 147_951_465
-            case .whisperSmall: return 487_601_967
-            case .whisperMedium: return 1_533_763_059
-            case .whisperLargeTurbo: return 1_624_555_275
-            case .whisperLarge: return 3_095_033_483
+            case .whisperTiny: return 45_981_088
+            case .whisperBase: return 84_962_880
+            case .whisperSmall: return 269_751_136
+            case .whisperMedium: return 831_538_144
+            case .whisperLargeTurbo: return 886_381_760
+            case .whisperLarge: return 1_668_741_440
             case .appleSpeech, .appleSpeechAnalyzer: return 0
             }
         }
@@ -3716,8 +4593,20 @@ final class SettingsStore: ObservableObject {
             }
         }
 
-        /// The ggml filename for Whisper models
+        /// The GGUF filename for transcribe.cpp Whisper models.
         var whisperModelFile: String? {
+            switch self {
+            case .whisperTiny: return "whisper-tiny-Q8_0.gguf"
+            case .whisperBase: return "whisper-base-Q8_0.gguf"
+            case .whisperSmall: return "whisper-small-Q8_0.gguf"
+            case .whisperMedium: return "whisper-medium-Q8_0.gguf"
+            case .whisperLargeTurbo: return "whisper-large-v3-turbo-Q8_0.gguf"
+            case .whisperLarge: return "whisper-large-v3-Q8_0.gguf"
+            default: return nil
+            }
+        }
+
+        var legacyWhisperModelFile: String? {
             switch self {
             case .whisperTiny: return "ggml-tiny.bin"
             case .whisperBase: return "ggml-base.bin"
@@ -3728,6 +4617,15 @@ final class SettingsStore: ObservableObject {
             default: return nil
             }
         }
+
+        static let legacyWhisperModelFiles: Set<String> = [
+            "ggml-tiny.bin",
+            "ggml-base.bin",
+            "ggml-small.bin",
+            "ggml-medium.bin",
+            "ggml-large-v3-turbo.bin",
+            "ggml-large-v3.bin",
+        ]
 
         /// The short model name for whisper.cpp internal usage
         var whisperModelName: String? {
@@ -3763,7 +4661,10 @@ final class SettingsStore: ObservableObject {
         /// Returns models available for the current Mac's architecture and OS
         static var availableModels: [SpeechModel] {
             allCases.filter { model in
-                if model == .whisperLargeTurbo {
+                if model == .whisperLargeTurbo, !CPUArchitecture.isAppleSilicon {
+                    return false
+                }
+                if model == .whisperLarge, !CPUArchitecture.isAppleSilicon {
                     return false
                 }
                 if model == .qwen3Asr, !Self.qwenPreviewEnabled {
@@ -3882,11 +4783,11 @@ final class SettingsStore: ObservableObject {
             case .whisperSmall:
                 return 4.0
             case .whisperMedium:
-                return 6.0
+                return 5.0
             case .whisperLargeTurbo:
-                return 8.0
+                return 6.0
             case .whisperLarge:
-                return 10.0 // Large model needs ~6-8GB working memory + model size
+                return 8.0
             }
         }
 
@@ -4014,15 +4915,6 @@ final class SettingsStore: ObservableObject {
             }
         }
 
-        var supportsFastDictationProcessing: Bool {
-            switch self {
-            case .parakeetTDT, .parakeetTDTv2:
-                return true
-            default:
-                return false
-            }
-        }
-
         /// Whether this model supports real-time streaming/chunk processing.
         /// Large Whisper models are too slow for streaming, so they only do final transcription on stop.
         var supportsStreaming: Bool {
@@ -4032,6 +4924,19 @@ final class SettingsStore: ObservableObject {
             default:
                 return true // All other models support streaming
             }
+        }
+
+        var supportsPronunciationMatching: Bool {
+            #if arch(arm64)
+            switch self {
+            case .parakeetTDT, .parakeetTDTv2:
+                return true
+            default:
+                return false
+            }
+            #else
+            return false
+            #endif
         }
 
         /// Preview update cadence for real-time transcription.
@@ -4312,6 +5217,8 @@ private extension SettingsStore {
     enum Keys {
         static let enableAIProcessing = "EnableAIProcessing"
         static let showMainWindowAtLoginLaunch = "ShowMainWindowAtLoginLaunch"
+        static let fileTranscriptionSpeakerLabelsEnabled = "FileTranscriptionSpeakerLabelsEnabled"
+        static let fileTranscriptionExpectedSpeakerCount = "FileTranscriptionExpectedSpeakerCount"
         static let dictationPromptOff = "DictationPromptOff"
         static let enableDebugLogs = "EnableDebugLogs"
         static let availableAIModels = "AvailableAIModels"
@@ -4320,6 +5227,10 @@ private extension SettingsStore {
         static let selectedModelByProvider = "SelectedModelByProvider"
         static let selectedProviderID = "SelectedProviderID"
         static let privateAIPrefixKVCacheEnabled = "PrivateAIProviderPrefixKVCacheEnabled"
+        static let privateAIBoostEnabled = "PrivateAIProviderBoostEnabled"
+        static let privateAIBackendPreference = SettingsStore.privateAIBackendPreferenceDefaultsKey
+        static let privateAIContextTokenLimit = "PrivateAIProviderContextTokenLimit"
+        static let privateAIContextDefaultMigratedTo4K = "PrivateAIProviderContextDefaultMigratedTo4K"
         static let providerAPIKeys = "ProviderAPIKeys"
         static let providerAPIKeyIdentifiers = "ProviderAPIKeyIdentifiers"
         static let savedProviders = "SavedProviders"
@@ -4329,8 +5240,13 @@ private extension SettingsStore {
         static let hotkeyShortcutKey = "HotkeyShortcutKey"
         static let primaryDictationShortcutsKey = "PrimaryDictationShortcuts"
         static let preferredInputDeviceUID = "PreferredInputDeviceUID"
+        static let microphonePriority = "MicrophonePriority"
+        static let suppressedMicrophoneUIDs = "SuppressedMicrophoneUIDs"
         static let preferredOutputDeviceUID = "PreferredOutputDeviceUID"
-        static let syncAudioDevicesWithSystem = "SyncAudioDevicesWithSystem"
+        static let microphoneSelectionMode = "MicrophoneSelectionMode"
+        // Keep the original persisted key so existing installs migrate in place.
+        static let microphoneSelectionMigrationVersion = "AppOnlyMicrophoneSelectionMigrationVersion"
+        static let showMicrophoneChangeAlerts = "ShowMicrophoneChangeAlerts"
         static let visualizerNoiseThreshold = "VisualizerNoiseThreshold"
         static let launchAtStartup = "LaunchAtStartup"
         static let showInDock = "ShowInDock"
@@ -4343,8 +5259,8 @@ private extension SettingsStore {
         static let pressAndHoldMode = "PressAndHoldMode"
         static let hotkeyMode = "HotkeyMode"
         static let enableStreamingPreview = "EnableStreamingPreview"
+        static let skipSilentRecordingsEnabled = "SkipSilentRecordingsEnabled"
         static let enableAIStreaming = "EnableAIStreaming"
-        static let parakeetFinalizationMode = "ParakeetFinalizationMode"
         static let copyTranscriptionToClipboard = "CopyTranscriptionToClipboard"
         static let textInsertionMode = "TextInsertionMode"
         static let autoUpdateCheckEnabled = "AutoUpdateCheckEnabled"
@@ -4355,6 +5271,8 @@ private extension SettingsStore {
         static let playgroundUsed = "PlaygroundUsed"
         static let onboardingCompleted = "OnboardingCompleted"
         static let onboardingGeneration = "OnboardingGeneration"
+        static let manualOnboardingResetRequested = "ManualOnboardingResetRequested"
+        static let manualOnboardingResetRequestedAt = "ManualOnboardingResetRequestedAt"
         static let onboardingCurrentStep = "OnboardingCurrentStep"
         static let onboardingAISkipped = "OnboardingAISkipped"
         static let onboardingPlaygroundValidated = "OnboardingPlaygroundValidated"
@@ -4367,6 +5285,8 @@ private extension SettingsStore {
         static let commandModeHotkeyShortcut = "CommandModeHotkeyShortcut"
         static let commandModeConfirmBeforeExecute = "CommandModeConfirmBeforeExecute"
         static let cancelRecordingHotkeyShortcut = "CancelRecordingHotkeyShortcut"
+        static let pasteLastTranscriptionHotkeyShortcut = "PasteLastTranscriptionHotkeyShortcut"
+        static let pasteLastTranscriptionShortcutEnabled = "PasteLastTranscriptionShortcutEnabled"
         static let commandModeLinkedToGlobal = "CommandModeLinkedToGlobal"
         static let commandModeShortcutEnabled = "CommandModeShortcutEnabled"
 
@@ -4400,6 +5320,11 @@ private extension SettingsStore {
         // Filler Words
         static let fillerWords = "FillerWords"
         static let removeFillerWordsEnabled = "RemoveFillerWordsEnabled"
+        static let autoConvertPunctuationEnabled = "AutoConvertPunctuationEnabled"
+        static let literalDictationFormattingEnabled = "LiteralDictationFormattingEnabled"
+        static let punctuationDictionaryPrefix = "PunctuationDictionaryPrefix"
+        static let punctuationDictionaryRules = "PunctuationDictionaryRules"
+        static let spokenFormattingActionRules = "SpokenFormattingActionRules"
 
         /// GAAV Mode (removes capitalization and trailing punctuation)
         static let gaavModeEnabled = "GAAVModeEnabled"
@@ -4413,7 +5338,9 @@ private extension SettingsStore {
 
         // Custom Dictionary
         static let customDictionaryEntries = "CustomDictionaryEntries"
+        static let automaticDictionaryLearningEnabled = "AutomaticDictionaryLearningEnabled"
         static let vocabularyBoostingEnabled = "VocabularyBoostingEnabled"
+        static let pronunciationMatchingEnabled = "PronunciationMatchingEnabled"
 
         // Transcription Provider (ASR)
         static let selectedTranscriptionProvider = "SelectedTranscriptionProvider"
@@ -4444,6 +5371,7 @@ private extension SettingsStore {
         static let dictationPromptProfiles = "DictationPromptProfiles"
         static let appPromptBindings = "AppPromptBindings"
         static let selectedDictationPromptID = "SelectedDictationPromptID"
+        static let sendCustomPromptOnly = "SendCustomPromptOnly"
         static let editPromptOff = "EditPromptOff"
         static let selectedEditPromptID = "SelectedEditPromptID"
         static let selectedWritePromptID = "SelectedWritePromptID" // legacy fallback key
@@ -4486,7 +5414,7 @@ extension SettingsStore {
             case .standard:
                 return "Fastest path. Inserts text without changing the clipboard, with paste fallback if direct insertion is unavailable."
             case .reliablePaste:
-                return "Compatibility path. Uses a temporary clipboard paste, so clipboard history apps may briefly record dictated text."
+                return "Compatibility path. Uses a temporary clipboard paste and restores your previous clipboard after insertion."
             }
         }
     }
@@ -4651,6 +5579,10 @@ extension SettingsStore {
                 if model == .nemotronStreaming320 {
                     return .nemotronStreaming
                 }
+                let requiresAppleSiliconWhisper = model == .whisperLargeTurbo || model == .whisperLarge
+                if requiresAppleSiliconWhisper, !CPUArchitecture.isAppleSilicon {
+                    return .whisperBase
+                }
                 // Validate model is available on this architecture
                 if model.requiresAppleSilicon && !CPUArchitecture.isAppleSilicon {
                     return .whisperBase
@@ -4747,7 +5679,7 @@ extension SettingsStore {
             case "ggml-base.bin": newModel = .whisperBase
             case "ggml-small.bin": newModel = .whisperSmall
             case "ggml-medium.bin": newModel = .whisperMedium
-            case "ggml-large-v3.bin": newModel = .whisperLarge
+            case "ggml-large-v3.bin": newModel = CPUArchitecture.isAppleSilicon ? .whisperLarge : .whisperBase
             default: newModel = .whisperBase
             }
         case "fluidAudio":

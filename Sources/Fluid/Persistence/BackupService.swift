@@ -13,6 +13,9 @@ struct SettingsBackupPayload: Codable, Equatable {
     let savedProviders: [SettingsStore.SavedProvider]
     let modelReasoningConfigs: [String: SettingsStore.ModelReasoningConfig]
     let privateAIPrefixKVCacheEnabled: Bool?
+    let privateAIBoostEnabled: Bool?
+    let privateAIBackendPreference: SettingsStore.PrivateAIBackendPreference?
+    let privateAIContextTokenLimit: Int?
     let selectedSpeechModel: SettingsStore.SpeechModel
     let selectedCohereLanguage: SettingsStore.CohereLanguage
     let selectedNemotronLanguage: SettingsStore.NemotronLanguage?
@@ -37,6 +40,9 @@ struct SettingsBackupPayload: Codable, Equatable {
     let rewriteModeSelectedProviderID: String
     let rewriteModeLinkedToGlobal: Bool
     let cancelRecordingHotkeyShortcut: HotkeyShortcut
+    // Optional so older backup files (which predate this setting) still decode.
+    let pasteLastTranscriptionHotkeyShortcut: HotkeyShortcut?
+    let pasteLastTranscriptionShortcutEnabled: Bool?
     let showThinkingTokens: Bool
     let hideFromDockAndAppSwitcher: Bool
     let showMainWindowAtLoginLaunch: Bool?
@@ -51,11 +57,20 @@ struct SettingsBackupPayload: Codable, Equatable {
     let pressAndHoldMode: Bool
     let hotkeyMode: HotkeyActivationMode?
     let enableStreamingPreview: Bool
+    // Optional so backups created before the silence filter still decode.
+    let skipSilentRecordingsEnabled: Bool?
     let enableAIStreaming: Bool
     let copyTranscriptionToClipboard: Bool
     let textInsertionMode: SettingsStore.TextInsertionMode
     let preferredInputDeviceUID: String?
+    // Optional so backups created before microphone priority ordering still decode.
+    // swiftlint:disable:next discouraged_optional_collection
+    let microphonePriority: [SettingsStore.MicrophonePriorityEntry]?
+    // Optional so backups created before microphone removal history still decode.
+    // swiftlint:disable:next discouraged_optional_collection
+    let suppressedMicrophoneUIDs: [String]?
     let preferredOutputDeviceUID: String?
+    let microphoneSelectionMode: SettingsStore.MicrophoneSelectionMode?
     let visualizerNoiseThreshold: Double
     let overlayPosition: SettingsStore.OverlayPosition
     let overlayBottomOffset: Double
@@ -66,9 +81,18 @@ struct SettingsBackupPayload: Codable, Equatable {
     let saveAudioWithTranscriptionHistory: Bool?
     let audioHistoryBudgetGB: Double?
     let notifyAIProcessingFailures: Bool?
+    let showMicrophoneChangeAlerts: Bool?
     let weekendsDontBreakStreak: Bool
     let fillerWords: [String]
     let removeFillerWordsEnabled: Bool
+    let autoConvertPunctuationEnabled: Bool?
+    let literalDictationFormattingEnabled: Bool?
+    let punctuationDictionaryPrefix: String?
+    // swiftlint:disable:next discouraged_optional_collection
+    let punctuationDictionaryRules: [SettingsStore.PunctuationDictionaryRule]?
+    // Optional so backups created before spoken formatting actions still decode.
+    // swiftlint:disable:next discouraged_optional_collection
+    let spokenFormattingActionRules: [SettingsStore.SpokenFormattingActionRule]?
     let gaavModeEnabled: Bool
     let gaavLowercaseFirstLetterEnabled: Bool?
     let gaavRemoveTrailingPeriodEnabled: Bool?
@@ -76,6 +100,8 @@ struct SettingsBackupPayload: Codable, Equatable {
     let continuousDictationSpacingEnabled: Bool?
     let contextAwareCapitalizationEnabled: Bool?
     let pauseMediaDuringTranscription: Bool
+    let automaticDictionaryLearningEnabled: Bool?
+    let pronunciationMatchingEnabled: Bool?
     let vocabularyBoostingEnabled: Bool
     let customDictionaryEntries: [SettingsStore.CustomDictionaryEntry]
     let selectedDictationPromptID: String?
@@ -86,6 +112,8 @@ struct SettingsBackupPayload: Codable, Equatable {
     let editPromptRoutingScope: SettingsStore.PromptRoutingScope?
     let defaultDictationPromptOverride: String?
     let defaultEditPromptOverride: String?
+    let fileTranscriptionSpeakerLabelsEnabled: Bool?
+    let fileTranscriptionExpectedSpeakerCount: Int?
 }
 
 struct AppBackupDocument: Codable, Equatable {
@@ -96,6 +124,9 @@ struct AppBackupDocument: Codable, Equatable {
     let promptProfiles: [SettingsStore.DictationPromptProfile]
     let appPromptBindings: [SettingsStore.AppPromptBinding]
     let transcriptionHistory: [TranscriptionHistoryEntry]
+    // Optional so backups created before pronunciation matching still decode.
+    // swiftlint:disable:next discouraged_optional_collection
+    let pronunciationProfiles: [PronunciationDictionaryProfile]?
 }
 
 enum BackupServiceError: LocalizedError {
@@ -112,20 +143,23 @@ enum BackupServiceError: LocalizedError {
     }
 }
 
+@MainActor
 final class BackupService {
     static let shared = BackupService()
 
     private init() {}
 
-    func makeBackupDocument() -> AppBackupDocument {
-        AppBackupDocument(
+    func makeBackupDocument() async -> AppBackupDocument {
+        let pronunciationProfiles = await PronunciationDictionaryStore.shared.allProfiles()
+        return AppBackupDocument(
             schemaVersion: .current,
             appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Unknown",
             exportedAt: Date(),
             settings: SettingsStore.shared.makeBackupPayload(),
             promptProfiles: SettingsStore.shared.dictationPromptProfiles,
             appPromptBindings: SettingsStore.shared.appPromptBindings,
-            transcriptionHistory: TranscriptionHistoryStore.shared.makeBackupPayload()
+            transcriptionHistory: TranscriptionHistoryStore.shared.makeBackupPayload(),
+            pronunciationProfiles: pronunciationProfiles
         )
     }
 
@@ -152,8 +186,14 @@ final class BackupService {
         }
     }
 
-    func restore(_ document: AppBackupDocument) throws {
+    func restore(_ document: AppBackupDocument) async throws {
         try self.validate(document)
+        // A legacy backup represents the complete state from before voice
+        // profiles existed. Restoring it must therefore clear newer profiles
+        // instead of leaving them attached to restored dictionary entry IDs.
+        try await PronunciationDictionaryStore.shared.replaceAllProfiles(
+            document.pronunciationProfiles ?? []
+        )
         SettingsStore.shared.restore(
             from: document.settings,
             promptProfiles: document.promptProfiles,

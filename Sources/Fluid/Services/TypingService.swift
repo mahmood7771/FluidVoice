@@ -54,6 +54,7 @@ final class TypingService {
     private static let pasteboardSessionSemaphore = DispatchSemaphore(value: 1)
     private static let pasteboardRestoreQueue = DispatchQueue(label: "TypingService.PasteboardRestore", qos: .utility)
     private static var focusSnapshot: FocusSnapshot?
+    private static let ghosttyBundleIdentifier = "com.mitchellh.ghostty"
 
     private var textInsertionMode: SettingsStore.TextInsertionMode {
         SettingsStore.shared.textInsertionMode
@@ -224,6 +225,43 @@ final class TypingService {
         return Self.isCurrentlyFocusedElement(element, expectedPID: pid)
     }
 
+    private func isGhosttyApplication(pid: pid_t) -> Bool {
+        guard pid > 0,
+              let app = NSRunningApplication(processIdentifier: pid)
+        else {
+            return false
+        }
+
+        return app.bundleIdentifier == Self.ghosttyBundleIdentifier
+    }
+
+    private func ghosttyTargetPID(preferredTargetPID: pid_t?) -> pid_t? {
+        if let preferredTargetPID, preferredTargetPID > 0 {
+            return self.isGhosttyApplication(pid: preferredTargetPID) ? preferredTargetPID : nil
+        }
+
+        if let focusedPID = self.getSystemFocusedElementAndPID()?.pid,
+           self.isGhosttyApplication(pid: focusedPID)
+        {
+            return focusedPID
+        }
+
+        if let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+           self.isGhosttyApplication(pid: frontmostPID)
+        {
+            return frontmostPID
+        }
+
+        return nil
+    }
+
+    /// Activation options used to restore focus to the external target app after dictation.
+    /// `.activateAllWindows` is intentionally omitted: raising every window of a multi-window
+    /// app (e.g. WebStorm) destroys the user's window layout on each dictation (issue #748).
+    static let focusRestoreActivationOptions: NSApplication.ActivationOptions = [
+        .activateIgnoringOtherApps,
+    ]
+
     /// Best-effort: activates the app with the given PID, unless it's Fluid itself.
     @discardableResult
     static func activateApp(pid: pid_t) -> Bool {
@@ -238,7 +276,7 @@ final class TypingService {
             return false
         }
 
-        return app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        return app.activate(options: Self.focusRestoreActivationOptions)
     }
 
     // MARK: - Public API
@@ -256,7 +294,17 @@ final class TypingService {
     /// Types/inserts text, optionally preferring a specific target PID for CGEvent posting.
     /// This helps when our overlay temporarily has focus; we can still target the original app.
     func typeTextInstantly(_ text: String, preferredTargetPID: pid_t?, textReadyAt: TimeInterval?) {
+        self.typeOutputPlanInstantly(.plain(text), preferredTargetPID: preferredTargetPID, textReadyAt: textReadyAt)
+    }
+
+    func typeOutputPlanInstantly(
+        _ plan: DictationLiteralOutputPlan,
+        preferredTargetPID: pid_t?,
+        textReadyAt: TimeInterval?,
+        tracksDictionaryCorrections: Bool = false
+    ) {
         let requestedAt = ProcessInfo.processInfo.systemUptime
+        let text = plan.plainText
         let mode = self.textInsertionMode
         let settleDelayMs: Int = {
             if mode == .reliablePaste {
@@ -266,7 +314,7 @@ final class TypingService {
         }()
         let textReadyAge = textReadyAt.map { Self.elapsedMs(from: $0, to: requestedAt) }
         self.bench(
-            "request chars=\(text.count) mode=\(mode.rawValue) preferredPID=\(preferredTargetPID.map { String($0) } ?? "nil") textReadyAgeMs=\(textReadyAge.map { String($0) } ?? "nil")"
+            "request chars=\(text.count) mode=\(mode.rawValue) autocompleteSteps=\(plan.steps.count) preferredPID=\(preferredTargetPID.map { String($0) } ?? "nil") textReadyAgeMs=\(textReadyAge.map { String($0) } ?? "nil")"
         )
         self.log("[TypingService] ENTRY: typeTextInstantly called with text length: \(text.count)")
         self.log("[TypingService] Text preview: \"\(String(text.prefix(100)))\"")
@@ -320,6 +368,14 @@ final class TypingService {
             self.bench(
                 "insert_return elapsedMs=\(Self.elapsedMs(since: insertStartedAt)) totalMs=\(Self.elapsedMs(since: requestedAt))"
             )
+            if tracksDictionaryCorrections {
+                Task { @MainActor in
+                    AutomaticDictionaryCorrectionTracker.shared.beginObservingInsertion(
+                        text,
+                        targetPID: preferredTargetPID
+                    )
+                }
+            }
         }
     }
 
@@ -340,6 +396,17 @@ final class TypingService {
     private func insertTextInstantly(_ text: String, preferredTargetPID: pid_t?) {
         self.log("[TypingService] insertTextInstantly called with \(text.count) characters")
         self.log("[TypingService] Attempting to type text: \"\(text.prefix(50))\(text.count > 50 ? "..." : "")\"")
+
+        if self.textInsertionMode == .standard,
+           let ghosttyTargetPID = self.ghosttyTargetPID(preferredTargetPID: preferredTargetPID)
+        {
+            self.log("[TypingService] Ghostty target detected in standard mode (PID \(ghosttyTargetPID)); forcing Reliable Paste path")
+            if self.tryReliablePasteInsertion(text, preferredTargetPID: ghosttyTargetPID) {
+                self.log("[TypingService] SUCCESS: Ghostty Reliable Paste path completed")
+                return
+            }
+            self.log("[TypingService] Ghostty Reliable Paste path fell through to direct-typing fallbacks")
+        }
 
         if self.textInsertionMode == .reliablePaste {
             self.log("[TypingService] Reliable Paste mode enabled")
@@ -561,6 +628,18 @@ final class TypingService {
         _ = pasteboard.writeObjects(restoredItems)
     }
 
+    /// Builds the pasteboard item for a temporary paste write, tagged with the nspasteboard.org
+    /// Transient and AutoGenerated marker types so clipboard managers exclude it from history.
+    /// `ConcealedType` is deliberately not used: it signals sensitive/password content, which
+    /// would be misleading for a dictation transcript.
+    static func makeTransientPasteboardItem(_ text: String) -> NSPasteboardItem {
+        let item = NSPasteboardItem()
+        item.setString(text, forType: .string)
+        item.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
+        item.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.AutoGeneratedType"))
+        return item
+    }
+
     private func withTemporaryPasteboardString(
         _ text: String,
         restoreDelayMicros: useconds_t,
@@ -578,7 +657,7 @@ final class TypingService {
         let snapshot = self.capturePasteboardSnapshot(pasteboard)
 
         pasteboard.clearContents()
-        guard pasteboard.setString(text, forType: .string) else {
+        guard pasteboard.writeObjects([Self.makeTransientPasteboardItem(text)]) else {
             self.log("[TypingService] ERROR: Failed to set temporary clipboard string")
             self.restorePasteboardSnapshot(snapshot, to: pasteboard)
             return false

@@ -17,6 +17,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var didRequestMainWindowReopen = false
     private var shouldSuppressNextReopenActivation = false
     private var wasLaunchedAsLoginItem = false
+    private var analyticsActivationSuppressionDeadline: Date?
+    private var hasDeferredMLXUpgradeOffer = false
+
+    var shouldPresentStartupMicrophoneNotice: Bool {
+        !self.wasLaunchedAsLoginItem || SettingsStore.shared.showMainWindowAtLoginLaunch
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Bring up file logging + crash handlers immediately during launch.
@@ -24,6 +30,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // Must be read during the launch callback - the current Apple Event identifies
         // login-item launches (used to optionally start silently, see issue #369).
         self.wasLaunchedAsLoginItem = Self.detectLoginItemLaunch()
+        if self.wasLaunchedAsLoginItem {
+            self.analyticsActivationSuppressionDeadline = Date().addingTimeInterval(3)
+        }
         DebugLogger.shared.info(
             "Application launched [loginItemLaunch=\(self.wasLaunchedAsLoginItem)]",
             source: "AppDelegate"
@@ -32,6 +41,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         // Initialize app settings (dock visibility, etc.)
         SettingsStore.shared.initializeAppSettings()
+        let shouldOfferMLXUpgrade = PrivateAIMLXUpgradeCoordinator.prepareOfferIfNeeded()
         LocalAPIServer.shared.start()
 
         // Record first-open synchronously before async analytics bootstrap so
@@ -40,14 +50,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         SettingsStore.shared.bootstrapOnboardingState(isTrueFirstOpen: isTrueFirstOpen)
 
         AnalyticsService.shared.bootstrap()
-
-        if isTrueFirstOpen {
-            AnalyticsService.shared.capture(.appFirstOpen)
-        }
-        AnalyticsService.shared.capture(
-            .appOpen,
-            properties: ["accessibility_trusted": AXIsProcessTrusted()]
-        )
 
         // Check for updates automatically if enabled (initial check on launch)
         self.checkForUpdatesAutomatically()
@@ -58,6 +60,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // Login Items can launch hidden; reveal the real SwiftUI window so ContentView startup runs.
         self.openMainWindowOnLaunch()
 
+        if shouldOfferMLXUpgrade {
+            if self.wasLaunchedAsLoginItem, !SettingsStore.shared.showMainWindowAtLoginLaunch {
+                self.hasDeferredMLXUpgradeOffer = true
+            } else {
+                self.scheduleMLXUpgradeOffer()
+            }
+        }
+
         // Note: App UI is designed with dark color scheme in mind
         // All gradients and effects are optimized for dark mode
     }
@@ -65,10 +75,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     func applicationWillTerminate(_ notification: Notification) {
         DebugLogger.shared.info("Application will terminate", source: "AppDelegate")
         self.shutdownPrivateAIRuntimeForTermination()
+        self.shutdownASRRuntimeForTermination()
         LocalAPIServer.shared.stop()
         // Clean up the update check timer
         self.updateCheckTimer?.invalidate()
         self.updateCheckTimer = nil
+    }
+
+    private func shutdownASRRuntimeForTermination() {
+        var didFinishShutdown = false
+        Task { @MainActor in
+            await AppServices.shared.shutdownForTermination()
+            didFinishShutdown = true
+        }
+
+        let deadline = Date().addingTimeInterval(8)
+        while !didFinishShutdown, Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+
+        if !didFinishShutdown {
+            DebugLogger.shared.warning(
+                "Timed out waiting for ASR runtime shutdown during termination",
+                source: "AppDelegate"
+            )
+        }
     }
 
     private func shutdownPrivateAIRuntimeForTermination() {
@@ -101,6 +132,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         sender.activate(ignoringOtherApps: true)
 
         return !self.bringMainWindowToFrontIfPresent()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        if let deadline = self.analyticsActivationSuppressionDeadline, Date() <= deadline {
+            self.analyticsActivationSuppressionDeadline = nil
+        } else {
+            self.analyticsActivationSuppressionDeadline = nil
+            AnalyticsService.shared.recordAppActivity()
+        }
+        if self.hasDeferredMLXUpgradeOffer {
+            self.hasDeferredMLXUpgradeOffer = false
+            self.scheduleMLXUpgradeOffer()
+        }
     }
 
     func userNotificationCenter(
@@ -181,6 +225,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                     self.requestMainWindowReopenIfNeeded(activate: revealWindow)
                 }
             }
+        }
+    }
+
+    private func scheduleMLXUpgradeOffer() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            self?.showMLXUpgradeOffer()
+        }
+    }
+
+    @MainActor
+    private func showMLXUpgradeOffer() {
+        let alert = NSAlert()
+        alert.messageText = "Fluid-1 is now 2.2x faster"
+        alert.informativeText = "A new 3.77 GB MLX model is available for Apple silicon. Continue to AI Enhancement to download and verify it. Your current slower model will keep working unless you choose to upgrade."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Continue to Download")
+        alert.addButton(withTitle: "Keep Current Model")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            PrivateAIMLXUpgradeCoordinator.beginUpgrade()
+            AppNavigationRouter.shared.request(.aiEnhancements)
+            self.bringMainWindowToFront()
+        } else {
+            PrivateAIMLXUpgradeCoordinator.keepCurrentModel()
         }
     }
 
@@ -310,12 +378,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                     repo: "Fluid-oss",
                     includePrerelease: includePrerelease
                 )
-                // If we get here, an update was found; SimpleUpdater will relaunch on success
-                // Show a quick heads-up before app restarts
-                self.showUpdateAlert(
-                    title: "Update Found!",
-                    message: "A new version is available and will be installed now."
-                )
+            } catch SimpleUpdateError.updateAlreadyInProgress {
+                DebugLogger.shared.info("Update installation already in progress", source: "AppDelegate")
             } catch {
                 if let pmkError = error as? PMKError, pmkError.isCancelled {
                     DebugLogger.shared.info("App is already up-to-date", source: "AppDelegate")
@@ -371,6 +435,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
                 if result.hasUpdate {
                     DebugLogger.shared.info("✅ Update available: \(result.latestVersion)", source: "AppDelegate")
+
+                    guard !SimpleUpdater.shared.isUpdateInProgress else {
+                        DebugLogger.shared.debug(
+                            "Update prompt skipped because installation is already in progress",
+                            source: "AppDelegate"
+                        )
+                        return
+                    }
 
                     // Check if user snoozed this version (clicked "Later")
                     if SettingsStore.shared.shouldShowUpdatePrompt(forVersion: result.latestVersion) {

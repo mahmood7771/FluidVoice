@@ -10,7 +10,7 @@ import Foundation
 
 // MARK: - File Transcription Entry Model
 
-struct FileTranscriptionEntry: Codable, Identifiable, Equatable {
+nonisolated struct FileTranscriptionEntry: Codable, Identifiable, Equatable {
     let id: UUID
     let timestamp: Date
     let fileName: String
@@ -18,6 +18,10 @@ struct FileTranscriptionEntry: Codable, Identifiable, Equatable {
     let processingTime: TimeInterval
     let confidence: Float
     let text: String
+    /// Speaker-attributed segments when diarization was enabled; empty otherwise.
+    let speakerSegments: [SpeakerTranscriptSegment]
+    let speakerLabelingNotice: String?
+    let speakerLabelingGaps: [SpeakerTranscriptGap]
 
     init(
         id: UUID = UUID(),
@@ -26,7 +30,10 @@ struct FileTranscriptionEntry: Codable, Identifiable, Equatable {
         duration: TimeInterval,
         processingTime: TimeInterval,
         confidence: Float,
-        text: String
+        text: String,
+        speakerSegments: [SpeakerTranscriptSegment] = [],
+        speakerLabelingNotice: String? = nil,
+        speakerLabelingGaps: [SpeakerTranscriptGap] = []
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -35,6 +42,9 @@ struct FileTranscriptionEntry: Codable, Identifiable, Equatable {
         self.processingTime = processingTime
         self.confidence = confidence
         self.text = text
+        self.speakerSegments = speakerSegments
+        self.speakerLabelingNotice = speakerLabelingNotice
+        self.speakerLabelingGaps = speakerLabelingGaps
     }
 
     init(from result: TranscriptionResult) {
@@ -45,6 +55,47 @@ struct FileTranscriptionEntry: Codable, Identifiable, Equatable {
         self.processingTime = result.processingTime
         self.confidence = result.confidence
         self.text = result.text
+        self.speakerSegments = result.speakerSegments
+        self.speakerLabelingNotice = result.speakerLabelingNotice
+        self.speakerLabelingGaps = result.speakerLabelingGaps
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, timestamp, fileName, duration, processingTime, confidence, text, speakerSegments
+        case speakerLabelingNotice, speakerLabelingGaps
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(UUID.self, forKey: .id)
+        self.timestamp = try c.decode(Date.self, forKey: .timestamp)
+        self.fileName = try c.decode(String.self, forKey: .fileName)
+        self.duration = try c.decode(TimeInterval.self, forKey: .duration)
+        self.processingTime = try c.decode(TimeInterval.self, forKey: .processingTime)
+        self.confidence = try c.decode(Float.self, forKey: .confidence)
+        self.text = try c.decode(String.self, forKey: .text)
+        // Older history entries predate speaker labels — tolerate a missing key.
+        self.speakerSegments = try c.decodeIfPresent([SpeakerTranscriptSegment].self, forKey: .speakerSegments) ?? []
+        self.speakerLabelingNotice = try c.decodeIfPresent(String.self, forKey: .speakerLabelingNotice)
+        self.speakerLabelingGaps = try c.decodeIfPresent([SpeakerTranscriptGap].self, forKey: .speakerLabelingGaps) ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.id, forKey: .id)
+        try c.encode(self.timestamp, forKey: .timestamp)
+        try c.encode(self.fileName, forKey: .fileName)
+        try c.encode(self.duration, forKey: .duration)
+        try c.encode(self.processingTime, forKey: .processingTime)
+        try c.encode(self.confidence, forKey: .confidence)
+        try c.encode(self.text, forKey: .text)
+        if !self.speakerSegments.isEmpty {
+            try c.encode(self.speakerSegments, forKey: .speakerSegments)
+        }
+        try c.encodeIfPresent(self.speakerLabelingNotice, forKey: .speakerLabelingNotice)
+        if !self.speakerLabelingGaps.isEmpty {
+            try c.encode(self.speakerLabelingGaps, forKey: .speakerLabelingGaps)
+        }
     }
 
     /// Preview text for list display (first 80 chars)
@@ -80,7 +131,10 @@ struct FileTranscriptionEntry: Codable, Identifiable, Equatable {
             duration: self.duration,
             processingTime: self.processingTime,
             fileName: self.fileName,
-            timestamp: self.timestamp
+            timestamp: self.timestamp,
+            speakerSegments: self.speakerSegments,
+            speakerLabelingNotice: self.speakerLabelingNotice,
+            speakerLabelingGaps: self.speakerLabelingGaps
         )
     }
 }

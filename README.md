@@ -1,14 +1,24 @@
 # FluidVoice
 
-[![GitHub stars](https://img.shields.io/github/stars/altic-dev/FluidVoice?style=social)](https://github.com/altic-dev/FluidVoice/stargazers)
-[![Sponsor FluidVoice](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/altic-dev)
-[![Supported Models](https://img.shields.io/badge/Models-Nemotron%20Speech%203.5%20%7C%20Parakeet%20Flash%20%7C%20Parakeet%20v3%20%26%20v2%20%7C%20Cohere%20%7C%20Apple%20Speech%20%7C%20Whisper-blue)](https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1)
+<p align="center">
+  <a href="https://github.com/altic-dev/FluidVoice/stargazers"><img src="https://img.shields.io/github/stars/altic-dev/FluidVoice?style=social" alt="GitHub stars"/></a>
+  <a href="https://github.com/sponsors/altic-dev"><img src="https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa?logo=githubsponsors&logoColor=white" alt="Sponsor FluidVoice"/></a>
+  <a href="https://x.com/fluidvoiceapp"><img src="https://img.shields.io/badge/X-%40fluidvoiceapp-black?logo=x&logoColor=white" alt="X @fluidvoiceapp"/></a>
+  <br />
+  <a href="https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1"><img src="https://img.shields.io/badge/Models-Nemotron%20Speech%203.5%20%7C%20Parakeet%20Flash%20%7C%20Parakeet%20v3%20%26%20v2%20%7C%20Cohere%20%7C%20Apple%20Speech%20%7C%20Whisper-blue" alt="Supported Models"/></a>
+  <br /><br />
+  <a href="https://trendshift.io/repositories/16601?utm_source=repository-badge&utm_medium=badge&utm_campaign=badge-repository-16601" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/16601" alt="altic-dev%2FFluidVoice | Trendshift" width="250" height="55"/></a>
+</p>
 
 Open source voice-to-text dictation app for macOS with on-device AI enhancement.
 
 **Install with Homebrew:** `brew install --cask fluidvoice`
 
 **Manual download:** [latest release](https://github.com/altic-dev/FluidVoice/releases/latest)
+
+> [!NOTE]
+> FluidVoice is on macOS today. **iOS and Windows are on the way** — join the waitlist to get notified when we launch: **[altic.dev/fluid/waitlist](https://www.altic.dev/fluid/waitlist)**
+
 
 > [!IMPORTANT]
 > This project is free and open source under GPLv3. If FluidVoice is useful to you, please star the repository — it helps visibility and keeps development going.
@@ -41,18 +51,6 @@ We're keeping Fluid Intelligence private for now so we can sustainably offer the
 
 ---
 
-## Star History
-
-<a href="https://star-history.com/#altic-dev/FluidVoice&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=altic-dev/FluidVoice&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=altic-dev/FluidVoice&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=altic-dev/FluidVoice&type=Date" />
-  </picture>
-</a>
-
----
-
 ## Fluid Intelligence Sneak Peek
 
 <table>
@@ -61,16 +59,16 @@ We're keeping Fluid Intelligence private for now so we can sustainably offer the
     <td width="50%" align="center"><b>Flowers</b></td>
   </tr>
   <tr>
-    <td width="50%"><video src="https://github.com/user-attachments/assets/6c7a7c4c-17a8-453d-8eff-1aa1fa9f6077" width="100%"></video></td>
     <td width="50%"><video src="https://github.com/user-attachments/assets/36747e9d-1ea3-4d27-8d38-eaacb6d57285" width="100%"></video></td>
+    <td width="50%"><video src="https://github.com/user-attachments/assets/5f6063ab-0506-4687-b825-c7bf4ab66ed6" width="100%"></video></td>
   </tr>
   <tr>
     <td width="50%" align="center"><b>Change Time & Name</b></td>
     <td width="50%" align="center"><b>Emoji</b></td>
   </tr>
   <tr>
+    <td width="50%"><video src="https://github.com/user-attachments/assets/6c7a7c4c-17a8-453d-8eff-1aa1fa9f6077" width="100%"></video></td>
     <td width="50%"><video src="https://github.com/user-attachments/assets/04e00f3d-a602-448d-9bde-50b5e8f61ac6" width="100%"></video></td>
-    <td width="50%"><video src="https://github.com/user-attachments/assets/5f6063ab-0506-4687-b825-c7bf4ab66ed6" width="100%"></video></td>
   </tr>
   <tr>
     <td width="50%" align="center"><b>Hyphens & Numbers</b></td>
@@ -91,16 +89,6 @@ https://github.com/user-attachments/assets/ffb47afd-1621-432a-bdca-baa4b8526301
 ### Write Mode — Write or rewrite text in any text box in any app
 
 https://github.com/user-attachments/assets/c57ef6d5-f0a1-4a3f-a121-637533442c24
-
-## Screenshots
-
-### Command Mode
-
-![Command Mode](assets/cmd_mode_ss.png)
-
-### History & Stats
-
-![History & Stats](assets/history__ss.png)
 
 ---
 
@@ -207,11 +195,25 @@ open Fluid.xcodeproj
 
 Build and run in Xcode. All dependencies are managed via Swift Package Manager.
 
-### Build Only (No Signing)
+Run a signed Debug build using the script:
 
 ```bash
-xcodebuild -project Fluid.xcodeproj -scheme Fluid -destination 'platform=macOS' build CODE_SIGNING_ALLOWED=NO
+./build.sh
 ```
+
+The signed build is written to `DerivedData/Build/Products/Debug/FluidVoice Debug.app`.
+Keep launching that product after each rebuild so macOS can preserve its Accessibility
+authorization.
+
+For CI or contributors who do not have a signing identity, use the explicit unsigned
+fallback:
+
+```bash
+./build.sh unsigned
+```
+
+Unsigned builds are tied to a specific executable version and may require Accessibility
+permission to be removed and granted again after rebuilding.
 
 ---
 
@@ -222,7 +224,7 @@ Contributions are welcome! Please create an issue first to discuss major changes
 ### Development Setup
 
 1. Clone and open in Xcode as above.
-2. **Signing:** `FluidVoice → Signing & Capabilities → Automatically manage signing → pick your Team` (Personal Team is fine). Stored in `xcuserdata/` (gitignored).
+2. **Signing:** `FluidVoice → Signing & Capabilities → Automatically manage signing → pick your Team` (Personal Team is fine). If you have certificates for multiple teams, select one without changing the project by running `FLUIDVOICE_DEVELOPMENT_TEAM=YOUR_TEAM_ID ./build.sh`.
 3. Build and run — SPM handles dependencies.
 4. **(Optional) Pre-commit hook** to prevent accidental team ID commits:
    ```bash
@@ -284,7 +286,7 @@ Anonymous analytics are enabled by default to track app health and feature usage
 
 Join our Discord: https://discord.gg/VUPHaKSvYV
 
-Follow development on X: [@ALTIC_DEV](https://x.com/ALTIC_DEV)
+Follow development on X: [@fluidvoiceapp](https://x.com/fluidvoiceapp)
 
 ---
 

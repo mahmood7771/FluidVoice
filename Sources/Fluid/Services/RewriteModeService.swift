@@ -83,6 +83,10 @@ final class RewriteModeService: ObservableObject {
 
     func processRewriteRequest(_ prompt: String) async {
         let startTime = Date()
+        AnalyticsService.shared.recordUsage(
+            mode: .edit,
+            aiModel: SettingsStore.shared.analyticsAIModelDescriptor(for: .edit)
+        )
         self.appendDiagnosticLog(
             "processRewriteRequest start | promptChars=\(prompt.count) | hadOriginal=\(!self.originalText.isEmpty) | contextChars=\(self.selectedContextText.count)"
         )
@@ -133,14 +137,6 @@ final class RewriteModeService: ObservableObject {
                 "processRewriteRequest success | writeMode=\(self.isWriteMode) | outputChars=\(response.count) | latency=\(String(format: "%.2fs", Date().timeIntervalSince(startTime)))"
             )
 
-            AnalyticsService.shared.capture(
-                .rewriteRunCompleted,
-                properties: [
-                    "write_mode": self.isWriteMode,
-                    "success": true,
-                    "latency_bucket": AnalyticsBuckets.bucketSeconds(Date().timeIntervalSince(startTime)),
-                ]
-            )
         } catch {
             self.conversationHistory.append(Message(role: .assistant, content: "Error: \(error.localizedDescription)"))
             self.isProcessing = false
@@ -148,14 +144,6 @@ final class RewriteModeService: ObservableObject {
                 "processRewriteRequest failure | writeMode=\(self.isWriteMode) | error=\(error.localizedDescription)"
             )
 
-            AnalyticsService.shared.capture(
-                .rewriteRunCompleted,
-                properties: [
-                    "write_mode": self.isWriteMode,
-                    "success": false,
-                    "latency_bucket": AnalyticsBuckets.bucketSeconds(Date().timeIntervalSince(startTime)),
-                ]
-            )
         }
     }
 
@@ -164,13 +152,6 @@ final class RewriteModeService: ObservableObject {
         NSApp.hide(nil) // Restore focus to the previous app
         self.typingService.typeTextInstantly(self.rewrittenText)
 
-        AnalyticsService.shared.capture(
-            .outputDelivered,
-            properties: [
-                "mode": AnalyticsMode.rewrite.rawValue,
-                "method": AnalyticsOutputMethod.typed.rawValue,
-            ]
-        )
     }
 
     func clearState() {
@@ -260,28 +241,6 @@ final class RewriteModeService: ObservableObject {
             self.logPromptTrace("Context block injected", value: contextBlock.isEmpty ? "<none>" : contextBlock)
             self.logPromptTrace("Final system prompt sent to model", value: systemPrompt)
             self.logPromptTrace("Conversation input (Q/history)", value: messageDump.isEmpty ? "<empty>" : messageDump)
-        }
-
-        // Route to Apple Intelligence if selected
-        if providerID == "apple-intelligence" {
-            #if canImport(FoundationModels)
-            if #available(macOS 26.0, *) {
-                let provider = AppleIntelligenceProvider()
-                let messageTuples = messages
-                    .map { (role: $0.role == .user ? "user" : "assistant", content: $0.content) }
-                DebugLogger.shared.debug("Using Apple Intelligence for edit mode", source: "RewriteModeService")
-                let output = try await provider.processRewrite(messages: messageTuples, systemPrompt: systemPrompt)
-                if self.shouldTracePromptProcessing {
-                    self.logPromptTrace("Model answer (A)", value: output)
-                }
-                return output
-            }
-            #endif
-            throw NSError(
-                domain: "RewriteMode",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Apple Intelligence not available"]
-            )
         }
 
         let model: String = {
@@ -473,9 +432,6 @@ final class RewriteModeService: ObservableObject {
         guard !self.isPrivateAIProviderID(providerID) else { return false }
         let key = self.providerKey(for: providerID)
         guard let stored = settings.verifiedProviderFingerprints[key] else { return false }
-        if providerID == "apple-intelligence" {
-            return stored == "apple-intelligence"
-        }
         let baseURL = self.providerBaseURL(for: providerID, settings: settings)
         let apiKey = settings.getAPIKey(for: providerID) ?? ""
         let current = self.providerFingerprint(baseURL: baseURL, apiKey: apiKey)

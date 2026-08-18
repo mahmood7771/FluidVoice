@@ -7,6 +7,7 @@
 
 import AppKit
 import Combine
+import QuartzCore
 import SwiftUI
 
 private enum OverlayShortcutResolver {
@@ -19,6 +20,19 @@ private enum OverlayShortcutResolver {
         case .command:
             return settings.commandModeHotkeyShortcut?.displayString ?? "Not set"
         }
+    }
+}
+
+enum RecordingOverlayHideOutcome: Equatable {
+    case hidden
+    case superseded
+}
+
+private final class BottomOverlayPanel: NSPanel {
+    var allowsOffscreenParking = false
+
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        self.allowsOffscreenParking ? frameRect : super.constrainFrameRect(frameRect, to: screen)
     }
 }
 
@@ -37,6 +51,11 @@ final class BottomOverlayWindowController {
     private var targetScreen: NSScreen?
     private var releaseTransitionActiveUntil: Date?
     private var deferredResizePending = false
+    private var presentationGeneration: UInt64 = 0
+    private let dismissalDuration: TimeInterval = 0.02
+    private var isHideInProgress = false
+    private var activeHideGeneration: UInt64?
+    private var hideWaiters: [CheckedContinuation<RecordingOverlayHideOutcome, Never>] = []
 
     private init() {
         NotificationCenter.default.addObserver(forName: NSNotification.Name("OverlayOffsetChanged"), object: nil, queue: .main) { [weak self] _ in
@@ -49,11 +68,43 @@ final class BottomOverlayWindowController {
                 self?.scheduleSizeAndPositionUpdate(after: 0)
             }
         }
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.targetScreen = OverlayScreenResolver.screenForCurrentPointer()
+                if NotchContentState.shared.isBottomOverlayPresented {
+                    self.positionWindow()
+                } else {
+                    self.parkWindowOffscreen()
+                }
+            }
+        }
+    }
+
+    /// Pay the one-time SwiftUI/WindowServer surface cost after launch and keep
+    /// the static panel outside the entire desktop so its surface is not evicted.
+    func prepare() {
+        guard self.window == nil else { return }
+        self.createWindow()
+        self.targetScreen = OverlayScreenResolver.screenForCurrentPointer()
+        guard let window else { return }
+
+        self.parkWindowOffscreen()
+        window.alphaValue = 1
+        window.orderFrontRegardless()
+        CATransaction.flush()
+        Self.overlayBench("bottom_prepared")
     }
 
     func show(audioPublisher: AnyPublisher<CGFloat, Never>, mode: OverlayMode) {
         let startedAt = ProcessInfo.processInfo.systemUptime
         Self.overlayBench("bottom_show_start mode=\(mode.rawValue) windowExists=\(self.window != nil)")
+        self.cancelInFlightHideForNewPresentation()
+        self.presentationGeneration &+= 1
 
         self.endReleaseTransition(flushDeferredUpdate: false)
         self.pendingResizeWorkItem?.cancel()
@@ -63,7 +114,15 @@ final class BottomOverlayWindowController {
         BottomOverlayActionsMenuController.shared.hide()
         self.ensureMouseDownMonitors()
 
-        // Update mode in content state
+        // Create window if needed
+        if self.window == nil {
+            self.createWindow()
+        }
+
+        // Prepare the complete first frame while the cached panel is still
+        // offscreen. Revealing the neutral shell first causes a visible flash
+        // that reads as the overlay appearing twice.
+        NotchContentState.shared.setBottomOverlayPresented(true)
         NotchContentState.shared.mode = mode
         switch mode {
         case .dictation: NotchContentState.shared.promptPickerMode = .dictate
@@ -75,34 +134,127 @@ final class BottomOverlayWindowController {
         NotchContentState.shared.setBottomOverlayDismissOffsetY(8)
         NotchContentState.shared.setBottomOverlayDismissing(false)
 
-        // Subscribe to audio levels and route through NotchContentState
+        self.targetScreen = OverlayScreenResolver.screenForCurrentPointer()
+        self.positionWindow()
+
+        // Submit one complete frame to WindowServer.
+        self.window?.setAccessibilityChildren(nil)
+        self.window?.setAccessibilityElement(true)
+        self.window?.alphaValue = 1
+        self.window?.orderFrontRegardless()
+        self.window?.contentView?.displayIfNeeded()
+        self.window?.displayIfNeeded()
+        CATransaction.flush()
+        Self.overlayBench("bottom_order_front elapsedMs=\(Self.elapsedMs(since: startedAt))")
+        Self.overlayBench("bottom_visible elapsedMs=\(Self.elapsedMs(since: startedAt))")
+
         self.audioSubscription?.cancel()
         self.audioSubscription = audioPublisher
             .receive(on: DispatchQueue.main)
             .sink { level in
                 NotchContentState.shared.bottomOverlayAudioLevel = level
             }
-
-        // Create window if needed
-        if self.window == nil {
-            self.createWindow()
-        }
-
-        self.targetScreen = OverlayScreenResolver.screenForCurrentPointer()
-        self.positionWindow()
-
-        // Show immediately; ASR startup can delay AppKit animation completions.
-        self.window?.alphaValue = 1
-        self.window?.orderFrontRegardless()
-        Self.overlayBench("bottom_order_front elapsedMs=\(Self.elapsedMs(since: startedAt))")
-        Self.overlayBench("bottom_fade_complete elapsedMs=\(Self.elapsedMs(since: startedAt))")
     }
 
     func hide() {
+        guard !self.isHideInProgress else { return }
+        self.isHideInProgress = true
+        self.presentationGeneration &+= 1
+        let currentGeneration = self.presentationGeneration
+        self.activeHideGeneration = currentGeneration
+        Task { [weak self] in
+            guard let self else { return }
+            let outcome = await self.performHideAndWait(generation: currentGeneration)
+            self.completeHideOperation(generation: currentGeneration, outcome: outcome)
+        }
+    }
+
+    /// Returns whether the panel finished hiding or a newer presentation
+    /// superseded this request.
+    func hideAndWait() async -> RecordingOverlayHideOutcome {
+        if self.isHideInProgress {
+            return await withCheckedContinuation { continuation in
+                self.hideWaiters.append(continuation)
+            }
+        }
+
+        self.isHideInProgress = true
+        self.presentationGeneration &+= 1
+        let currentGeneration = self.presentationGeneration
+        self.activeHideGeneration = currentGeneration
+        let outcome = await self.performHideAndWait(generation: currentGeneration)
+        self.completeHideOperation(generation: currentGeneration, outcome: outcome)
+        return outcome
+    }
+
+    private func completeHideOperation(generation: UInt64, outcome: RecordingOverlayHideOutcome) {
+        guard self.activeHideGeneration == generation else { return }
+        self.activeHideGeneration = nil
+        self.isHideInProgress = false
+        let waiters = self.hideWaiters
+        self.hideWaiters.removeAll(keepingCapacity: true)
+        waiters.forEach { $0.resume(returning: outcome) }
+    }
+
+    private func cancelInFlightHideForNewPresentation() {
+        guard self.isHideInProgress else { return }
+        self.activeHideGeneration = nil
+        self.isHideInProgress = false
+        let waiters = self.hideWaiters
+        self.hideWaiters.removeAll(keepingCapacity: true)
+        waiters.forEach { $0.resume(returning: .superseded) }
+        Self.overlayBench("bottom_hide_cancelled_for_new_presentation")
+    }
+
+    private func performHideAndWait(generation currentGeneration: UInt64) async -> RecordingOverlayHideOutcome {
         let startedAt = ProcessInfo.processInfo.systemUptime
         Self.overlayBench("bottom_hide_start windowExists=\(self.window != nil)")
+        guard self.presentationGeneration == currentGeneration else {
+            Self.overlayBench("bottom_hide_return reason=stale_generation")
+            return .superseded
+        }
 
-        // Cancel audio subscription
+        guard let window = self.window, NotchContentState.shared.isBottomOverlayPresented else {
+            self.clearPresentationResources()
+            self.endReleaseTransition(flushDeferredUpdate: false)
+            NotchContentState.shared.setBottomOverlayDismissing(false)
+            NotchContentState.shared.targetAppIcon = nil
+            Self.overlayBench("bottom_hide_return reason=no_window")
+            return .hidden
+        }
+
+        NotchContentState.shared.setBottomOverlayReleaseTransitioning(true)
+        NotchContentState.shared.setBottomOverlayDismissOffsetY(8)
+        NotchContentState.shared.setBottomOverlayDismissing(true)
+
+        // SwiftUI owns the dismissal animation. Keeping AppKit alpha at 1
+        // prevents an old implicit window animation from hiding a rapid restart.
+        Self.overlayBench("bottom_hide_animation_start")
+        await Task.yield()
+        guard self.presentationGeneration == currentGeneration else {
+            Self.overlayBench("bottom_hide_return reason=stale_generation")
+            return .superseded
+        }
+        self.clearPresentationResources()
+
+        try? await Task.sleep(nanoseconds: UInt64(self.dismissalDuration * 1_000_000_000))
+
+        guard self.presentationGeneration == currentGeneration else {
+            Self.overlayBench("bottom_hide_return reason=stale_generation")
+            return .superseded
+        }
+
+        self.parkWindowOffscreen()
+        window.alphaValue = 1
+        NotchContentState.shared.setBottomOverlayPresented(false)
+        self.endReleaseTransition(flushDeferredUpdate: false)
+        NotchContentState.shared.setBottomOverlayDismissing(false)
+        NotchContentState.shared.targetAppIcon = nil
+        Self.overlayBench("bottom_hide_complete elapsedMs=\(Self.elapsedMs(since: startedAt))")
+        return .hidden
+    }
+
+    private func clearPresentationResources() {
         self.audioSubscription?.cancel()
         self.audioSubscription = nil
         self.pendingResizeWorkItem?.cancel()
@@ -113,28 +265,8 @@ final class BottomOverlayWindowController {
         BottomOverlayPromptMenuController.shared.hide()
         BottomOverlayModeMenuController.shared.hide()
         BottomOverlayActionsMenuController.shared.hide()
-
-        // Reset state
         NotchContentState.shared.setProcessing(false)
         NotchContentState.shared.bottomOverlayAudioLevel = 0
-        NotchContentState.shared.targetAppIcon = nil
-
-        guard let window = window else {
-            self.endReleaseTransition(flushDeferredUpdate: false)
-            NotchContentState.shared.setBottomOverlayDismissing(false)
-            Self.overlayBench("bottom_hide_return reason=no_window")
-            return
-        }
-
-        NotchContentState.shared.setBottomOverlayReleaseTransitioning(true)
-        NotchContentState.shared.setBottomOverlayDismissOffsetY(28)
-        NotchContentState.shared.setBottomOverlayDismissing(true)
-
-        window.alphaValue = 0
-        window.orderOut(nil)
-        self.endReleaseTransition(flushDeferredUpdate: false)
-        NotchContentState.shared.setBottomOverlayDismissing(false)
-        Self.overlayBench("bottom_hide_complete elapsedMs=\(Self.elapsedMs(since: startedAt))")
     }
 
     func setProcessing(_ processing: Bool) {
@@ -239,7 +371,7 @@ final class BottomOverlayWindowController {
     }
 
     private func createWindow() {
-        let panel = NSPanel(
+        let panel = BottomOverlayPanel(
             contentRect: .zero,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -269,6 +401,8 @@ final class BottomOverlayWindowController {
 
         panel.setContentSize(fittingSize)
         panel.contentView = hostingView
+        hostingView.layoutSubtreeIfNeeded()
+        hostingView.display()
 
         self.window = panel
     }
@@ -332,6 +466,11 @@ final class BottomOverlayWindowController {
     private func positionWindow() {
         // Safe check for window and screen availability
         guard let window = window else { return }
+        guard NotchContentState.shared.isBottomOverlayPresented else {
+            self.parkWindowOffscreen()
+            return
+        }
+        (window as? BottomOverlayPanel)?.allowsOffscreenParking = false
 
         let screen = self.targetScreen ?? window.screen ?? OverlayScreenResolver.screenForCurrentPointer()
         guard let screen = screen else { return }
@@ -359,6 +498,21 @@ final class BottomOverlayWindowController {
 
         // Apply position directly to avoid implicit frame animations during hover-driven resizes.
         window.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func parkWindowOffscreen() {
+        guard let window else { return }
+        window.setAccessibilityChildren([])
+        window.setAccessibilityElement(false)
+        (window as? BottomOverlayPanel)?.allowsOffscreenParking = true
+        let desktopFrame = NSScreen.screens.reduce(NSRect.null) { partial, screen in
+            partial.union(screen.frame)
+        }
+        let edge = desktopFrame.isNull ? NSPoint(x: 100_000, y: 100_000) : NSPoint(
+            x: desktopFrame.maxX + window.frame.width + 1024,
+            y: desktopFrame.maxY + window.frame.height + 1024
+        )
+        window.setFrameOrigin(edge)
     }
 }
 
@@ -1533,10 +1687,11 @@ private struct BottomOverlayActionsMenuView: View {
 
     private var canCopyLast: Bool {
         guard !self.contentState.isProcessing else { return false }
-        guard let latest = self.latestEntry else { return false }
-        let processed = latest.processedText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let raw = latest.rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !(processed.isEmpty && raw.isEmpty)
+        return self.latestEntry?.clipboardText != nil
+    }
+
+    private var canPasteLast: Bool {
+        self.canCopyLast
     }
 
     private var canUndoLastAI: Bool {
@@ -1627,6 +1782,15 @@ private struct BottomOverlayActionsMenuView: View {
                 enabled: self.canCopyLast
             ) {
                 self.contentState.onCopyLastRequested?()
+            }
+
+            self.actionRow(
+                title: "Paste Last Transcription",
+                icon: "arrow.down.doc",
+                rowID: "paste_last",
+                enabled: self.canPasteLast
+            ) {
+                self.contentState.onPasteLastRequested?()
             }
 
             Divider()
@@ -1810,6 +1974,7 @@ struct BottomOverlayView: View {
     @State private var processingStatusVisible = false
     @State private var processingStatusCycleID = 0
     @State private var lastResolvedAppIcon: NSImage?
+    @State private var borderAnimationStartedAt: Date?
 
     struct LayoutConstants {
         let hPadding: CGFloat
@@ -2110,7 +2275,8 @@ struct BottomOverlayView: View {
     }
 
     private var shouldReservePreviewArea: Bool {
-        self.layout.showsPreview && self.settings.enableStreamingPreview
+        self.layout.showsPreview &&
+            (self.settings.enableStreamingPreview || self.contentState.isAIProcessingFailureVisible)
     }
 
     private var overlayFrameHeight: CGFloat? {
@@ -2150,6 +2316,9 @@ struct BottomOverlayView: View {
 
     private var currentPreviewSizingText: String {
         guard self.shouldReservePreviewArea else { return "" }
+        if self.shouldShowProcessingPreview {
+            return self.processingPreviewText
+        }
         return self.shouldShowProcessingStatus ? self.processingStatusText : self.transcriptionPreviewText
     }
 
@@ -2162,7 +2331,10 @@ struct BottomOverlayView: View {
     }
 
     private var shouldSuppressPreviewDuringRelease: Bool {
-        self.contentState.isBottomOverlayReleaseTransitioning || self.contentState.isBottomOverlayDismissing
+        if self.shouldShowProcessingPreview {
+            return false
+        }
+        return self.contentState.isBottomOverlayReleaseTransitioning || self.contentState.isBottomOverlayDismissing
     }
 
     private func previewResizeBucket(for previewText: String) -> Int {
@@ -2203,6 +2375,22 @@ struct BottomOverlayView: View {
         return ""
     }
 
+    private var processingPreviewText: String {
+        guard self.contentState.isProcessing else { return "" }
+        let preview = self.transcriptionPreviewText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !Self.transientOverlayStatusTexts.contains(preview) else { return "" }
+        return self.transcriptionPreviewText
+    }
+
+    private var shouldShowProcessingPreview: Bool {
+        !self.processingPreviewText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func richPreviewText(_ previewText: String) -> Text {
+        Text(previewText)
+            .foregroundColor(.white.opacity(0.9))
+    }
+
     private var overlayBorderLineWidth: CGFloat {
         self.settings.overlaySize == .large ? 0.8 : 1
     }
@@ -2231,7 +2419,7 @@ struct BottomOverlayView: View {
     }
 
     private var overlayAnimatedScale: CGFloat {
-        self.contentState.isBottomOverlayDismissing ? 0.97 : 1.0
+        self.contentState.isBottomOverlayDismissing ? 0.985 : 1.0
     }
 
     private var overlayAnimatedOpacity: Double {
@@ -2590,17 +2778,23 @@ struct BottomOverlayView: View {
 
     private var aiProcessingFailureView: some View {
         HStack(spacing: 8) {
-            Text("AI Enhancement failed")
+            Text(self.contentState.aiProcessingFailureMessage)
                 .font(.system(size: self.layout.transFontSize, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.9))
+                .foregroundStyle(
+                    self.contentState.canRetryAIProcessingFailure
+                        ? Color.white.opacity(0.9)
+                        : Color.orange.opacity(0.9)
+                )
                 .lineLimit(1)
                 .truncationMode(.tail)
 
             Spacer(minLength: 4)
 
-            self.failureIconButton(systemName: "arrow.clockwise", help: "Try again") {
-                self.contentState.clearAIProcessingFailure()
-                self.contentState.onReprocessLastRequested?()
+            if self.contentState.canRetryAIProcessingFailure {
+                self.failureIconButton(systemName: "arrow.clockwise", help: "Try again") {
+                    self.contentState.clearAIProcessingFailure()
+                    self.contentState.onReprocessLastRequested?()
+                }
             }
 
             self.failureIconButton(systemName: "xmark", help: "Dismiss") {
@@ -2609,6 +2803,49 @@ struct BottomOverlayView: View {
             }
         }
         .frame(maxWidth: self.previewMaxWidth, alignment: .leading)
+    }
+
+    private func scrollablePreviewText(_ previewText: String) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: false) {
+                self.richPreviewText(previewText)
+                    .font(.system(size: self.layout.transFontSize, weight: .medium))
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Color.clear.frame(height: 1).id("bottom")
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .clipped()
+            .onChange(of: previewText) { _, _ in
+                DispatchQueue.main.async {
+                    proxy.scrollTo("bottom", anchor: .bottom)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func dynamicPreviewText(_ previewText: String) -> some View {
+        if self.settings.overlaySize == .small {
+            self.richPreviewText(previewText)
+                .font(.system(size: self.layout.transFontSize, weight: .medium))
+                .multilineTextAlignment(.leading)
+                .lineLimit(1)
+                .truncationMode(.head)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, max(2, self.transcriptionVerticalPadding - 1))
+        } else {
+            self.richPreviewText(previewText)
+                .font(.system(size: self.layout.transFontSize, weight: .medium))
+                .multilineTextAlignment(.leading)
+                .lineLimit(Int(self.previewMaxHeight / max(self.estimatedPreviewLineHeight, 1)))
+                .truncationMode(.head)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: self.previewMaxWidth, alignment: .leading)
+                .padding(.vertical, self.transcriptionVerticalPadding)
+        }
     }
 
     var body: some View {
@@ -2636,6 +2873,8 @@ struct BottomOverlayView: View {
                                 Color.clear
                             } else if self.shouldShowAIProcessingFailure {
                                 self.aiProcessingFailureView
+                            } else if self.shouldShowProcessingPreview {
+                                self.scrollablePreviewText(self.processingPreviewText)
                             } else if self.shouldShowProcessingStatus {
                                 // Temporarily hidden; the waveform sweep carries processing state.
                                 // ShimmerText(
@@ -2694,6 +2933,8 @@ struct BottomOverlayView: View {
                                 Color.clear
                             } else if self.shouldShowAIProcessingFailure {
                                 self.aiProcessingFailureView
+                            } else if self.shouldShowProcessingPreview {
+                                self.dynamicPreviewText(self.processingPreviewText)
                             } else if self.hasTranscription && !self.contentState.isProcessing {
                                 let previewText = self.transcriptionPreviewText
                                 if !previewText.isEmpty {
@@ -2818,7 +3059,7 @@ struct BottomOverlayView: View {
                     if self.isPillSize {
                         // Glossy border: a bright highlight that slowly rotates around the edge.
                         // Paused under reduce-motion to avoid continuous redraws on low-resource Macs.
-                        if self.reduceMotion {
+                        if self.reduceMotion || !self.contentState.isBottomOverlayPresented {
                             RoundedRectangle(cornerRadius: self.layout.cornerRadius)
                                 .strokeBorder(
                                     AngularGradient(
@@ -2837,7 +3078,10 @@ struct BottomOverlayView: View {
                                 )
                         } else {
                             TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
-                                let seconds = timeline.date.timeIntervalSinceReferenceDate
+                                let seconds = max(
+                                    0,
+                                    timeline.date.timeIntervalSince(self.borderAnimationStartedAt ?? timeline.date)
+                                )
                                 let angle = (seconds.truncatingRemainder(dividingBy: 6.0) / 6.0) * 360.0
                                 RoundedRectangle(cornerRadius: self.layout.cornerRadius)
                                     .strokeBorder(
@@ -2892,11 +3136,14 @@ struct BottomOverlayView: View {
         .scaleEffect(self.overlayAnimatedScale, anchor: .center)
         .offset(y: self.overlayAnimatedOffsetY)
         .opacity(self.overlayAnimatedOpacity)
-        .animation(.timingCurve(0.22, 0.0, 0.2, 1.0, duration: 0.28), value: self.contentState.isBottomOverlayDismissing)
+        .animation(.timingCurve(0.22, 0.0, 0.2, 1.0, duration: 0.02), value: self.contentState.isBottomOverlayDismissing)
         .onChange(of: self.settings.overlaySize) { _, _ in
             self.dynamicPreviewResizeBucket = self.previewResizeBucket(for: self.currentPreviewSizingText)
             self.frozenDynamicPreviewHeight = nil
             BottomOverlayWindowController.shared.refreshSizeForContent()
+        }
+        .onChange(of: self.contentState.isBottomOverlayPresented) { _, presented in
+            self.borderAnimationStartedAt = presented ? Date() : nil
         }
         .onChange(of: self.settings.enableStreamingPreview) { _, _ in
             self.dynamicPreviewResizeBucket = self.previewResizeBucket(for: self.currentPreviewSizingText)
